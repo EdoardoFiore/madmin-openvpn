@@ -1,0 +1,73 @@
+{
+    "id": "openvpn",
+    "name": "OpenVPN Manager",
+    "version": "0.1.0",
+    "description": "OpenVPN server and client management with PKI, certificate generation, and multi-instance support",
+    "author": "MADMIN Team",
+    "system_dependencies": {
+        "apt": [
+            "openvpn",
+            "easy-rsa",
+            "openssl"
+        ],
+        "pip": []
+    },
+    "database_migrations": [
+        "migrations/001_initial.py"
+    ],
+    "install_hooks": {
+        "pre_install": null,
+        "post_install": "hooks/post_install.py",
+        "pre_uninstall": "hooks/pre_uninstall.py",
+        "post_uninstall": null,
+        "pre_update": null,
+        "post_update": "hooks/post_update.py"
+    },
+    "backend_router": "router.py",
+    "static_dir": "static",
+    "frontend_entry": "views/main.js",
+    "permissions": [
+        {
+            "slug": "openvpn.view",
+            "description": "Visualizza istanze OpenVPN"
+        },
+        {
+            "slug": "openvpn.manage",
+            "description": "Crea/modifica istanze OpenVPN"
+        },
+        {
+            "slug": "openvpn.clients",
+            "description": "Gestione client VPN"
+        }
+    ],
+    "menu": [
+        {
+            "label": "OpenVPN",
+            "icon": "lock",
+            "route": "#openvpn"
+        }
+    ],
+    "firewall_chains": [
+        {
+            "name": "MOD_OVPN_INPUT",
+            "parent": "MADMIN_INPUT",
+            "priority": 50
+        },
+        {
+            "name": "MOD_OVPN_FORWARD",
+            "parent": "MADMIN_FORWARD",
+            "priority": 50
+        }
+    ],
+    "backup": {
+        "external_paths": [
+            "/etc/openvpn/server",
+            "/etc/openvpn/client",
+            "/etc/openvpn/easy-rsa"
+        ],
+        "restore_hooks": {
+            "post_restore": "hooks/post_restore.py"
+        }
+    },
+    "dependencies": []
+}
