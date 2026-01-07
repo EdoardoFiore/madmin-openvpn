@@ -1,0 +1,57 @@
+name: Create Release
+
+on:
+  push:
+    tags:
+      - 'v*'  # Triggers on tags like v1.0.0, v1.0.1, etc.
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # Required to create releases
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Get version from tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+      
+      - name: Read manifest for release notes
+        id: manifest
+        run: |
+          if [ -f manifest.json ]; then
+            NAME=$(jq -r '.name // "Module"' manifest.json)
+            DESC=$(jq -r '.description // "No description"' manifest.json)
+            echo "NAME=$NAME" >> $GITHUB_OUTPUT
+            echo "DESC=$DESC" >> $GITHUB_OUTPUT
+          else
+            echo "NAME=Module" >> $GITHUB_OUTPUT
+            echo "DESC=New release" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Create ZIP archive
+        run: |
+          # Create a clean ZIP without .git folder
+          zip -r module.zip . -x ".git/*" -x ".github/*" -x "*.md" -x ".gitignore"
+      
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          name: "${{ steps.manifest.outputs.NAME }} v${{ steps.version.outputs.VERSION }}"
+          body: |
+            ## ${{ steps.manifest.outputs.NAME }} v${{ steps.version.outputs.VERSION }}
+            
+            ${{ steps.manifest.outputs.DESC }}
+            
+            ### Installation
+            Install directly from the MADMIN Module Store, or download the ZIP below.
+            
+            ---
+            *Auto-generated release*
+          files: module.zip
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

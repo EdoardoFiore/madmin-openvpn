@@ -10,7 +10,9 @@
             "easy-rsa",
             "openssl"
         ],
-        "pip": []
+        "pip": [
+            "qrcode>=7.3"
+        ]
     },
     "database_migrations": [
         "migrations/001_initial.py"
@@ -38,6 +40,10 @@
         {
             "slug": "openvpn.clients",
             "description": "Gestione client VPN"
+        },
+        {
+            "slug": "openvpn.groups",
+            "description": "Gestione gruppi firewall"
         }
     ],
     "menu": [
