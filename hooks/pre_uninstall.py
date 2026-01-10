@@ -86,9 +86,9 @@ async def run():
     
     # 5. Remove MADMIN -> module jump rules (the core will handle this, but clean up just in case)
     for table, parent, chain in [
-        ("filter", "MADMIN_INPUT", "MOD_OVPN_INPUT"),
-        ("filter", "MADMIN_FORWARD", "MOD_OVPN_FORWARD"),
-        ("nat", "MADMIN_POSTROUTING", "MOD_OVPN_NAT"),
+        ("filter", "INPUT", "MOD_OVPN_INPUT"),
+        ("filter", "FORWARD", "MOD_OVPN_FORWARD"),
+        ("nat", "POSTROUTING", "MOD_OVPN_NAT"),
     ]:
         subprocess.run(["iptables", "-t", table, "-D", parent, "-j", chain], capture_output=True)
     
