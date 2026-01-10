@@ -14,7 +14,7 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 
-def run():
+async def run():
     """Post-install hook for OpenVPN module."""
     logger.info("Running OpenVPN post-install hook")
     

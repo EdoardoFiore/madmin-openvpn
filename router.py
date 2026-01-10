@@ -15,9 +15,9 @@ from sqlalchemy import select, func
 import secrets
 import qrcode
 
-from backend.core.database import get_session
-from backend.core.auth.dependencies import require_permission
-from backend.core.auth.models import User
+from core.database import get_session
+from core.auth.dependencies import require_permission
+from core.auth.models import User
 
 from .models import (
     OvpnInstance, OvpnInstanceCreate, OvpnInstanceRead,
@@ -61,7 +61,7 @@ async def list_instances(
         is_running = openvpn_service.get_instance_status(inst.id)
         
         response.append(OvpnInstanceRead(
-            **inst.model_dump(),
+            **inst.model_dump(exclude={"status", "clients", "groups"}),
             status="running" if is_running else "stopped",
             client_count=client_count
         ))
@@ -130,16 +130,11 @@ async def create_instance(
     )
     db.add(instance)
     
-    # Generate server config
+    # Generate server config - write directly where systemd expects it
     config = openvpn_service.create_server_config(instance)
-    config_path = OPENVPN_BASE_DIR / instance_id / f"{instance_id}.conf"
+    config_path = OPENVPN_BASE_DIR / f"{instance_id}.conf"
     config_path.write_text(config)
     config_path.chmod(0o600)
-    
-    # Create symlink for systemd
-    systemd_config = OPENVPN_BASE_DIR / f"{instance_id}.conf"
-    if not systemd_config.exists():
-        systemd_config.symlink_to(config_path)
     
     # Generate initial CRL
     openvpn_service.regenerate_crl(instance_id)
@@ -147,7 +142,7 @@ async def create_instance(
     await db.commit()
     
     return OvpnInstanceRead(
-        **instance.model_dump(),
+        **instance.model_dump(exclude={"status", "clients", "groups"}),
         status="stopped",
         client_count=0
     )
@@ -176,7 +171,7 @@ async def get_instance(
     is_running = openvpn_service.get_instance_status(instance_id)
     
     return OvpnInstanceRead(
-        **instance.model_dump(),
+        **instance.model_dump(exclude={"status", "clients", "groups"}),
         status="running" if is_running else "stopped",
         client_count=client_count
     )
@@ -197,14 +192,29 @@ async def delete_instance(
     # Stop instance
     openvpn_service.stop_instance(instance_id)
     
-    # Remove firewall rules
+    # Remove group chains first (needs DB access)
+    from .service import OpenVPNService
+    await OpenVPNService.remove_all_group_chains(instance.id, db)
+    
+    # Remove instance firewall rules
     openvpn_service.remove_instance_firewall_rules(instance_id)
     
-    # Delete from database
+    # Delete config file
+    config_path = OPENVPN_BASE_DIR / f"{instance_id}.conf"
+    if config_path.exists():
+        config_path.unlink()
+    
+    # Delete from database (cascades to clients, groups, etc.)
     await db.delete(instance)
     await db.commit()
     
-    # Note: PKI files remain on disk for potential backup/recovery
+    # Delete instance directory (PKI, CCD, etc.)
+    import shutil
+    instance_dir = openvpn_service.get_instance_dir(instance_id)
+    if instance_dir.exists():
+        shutil.rmtree(instance_dir)
+    
+    logger.info(f"Deleted instance {instance_id} and all related files")
 
 
 @router.post("/instances/{instance_id}/start")
@@ -226,6 +236,9 @@ async def start_instance(
             instance.interface, instance.subnet,
             instance.tunnel_mode, instance.routes
         )
+        # Also apply group rules (member jumps, default policy)
+        from .service import OpenVPNService
+        await OpenVPNService.apply_group_firewall_rules(instance.id, db)
         return {"status": "running"}
     raise HTTPException(500, "Failed to start instance")
 
@@ -243,6 +256,9 @@ async def stop_instance(
         raise HTTPException(404, "Instance not found")
     
     if openvpn_service.stop_instance(instance_id):
+        # Remove firewall rules when interface stops
+        from .service import OpenVPNService
+        await OpenVPNService.remove_all_group_chains(instance.id, db)
         openvpn_service.remove_instance_firewall_rules(instance_id)
         return {"status": "stopped"}
     raise HTTPException(500, "Failed to stop instance")
@@ -270,7 +286,7 @@ async def update_instance_routing(
     # Update instance
     instance.tunnel_mode = data.tunnel_mode
     instance.routes = data.routes
-    if data.dns_servers:
+    if data.dns_servers is not None:  # Allow empty list to clear DNS
         instance.dns_servers = data.dns_servers
     instance.updated_at = datetime.utcnow()
     
@@ -279,7 +295,7 @@ async def update_instance_routing(
     
     # Regenerate config
     config = openvpn_service.create_server_config(instance)
-    config_path = OPENVPN_BASE_DIR / instance_id / f"{instance_id}.conf"
+    config_path = OPENVPN_BASE_DIR / f"{instance_id}.conf"
     config_path.write_text(config)
     
     # Reapply firewall if running
@@ -290,20 +306,11 @@ async def update_instance_routing(
             instance.tunnel_mode, instance.routes
         )
     
-    # Count affected clients
-    count_result = await db.execute(
-        select(func.count()).select_from(OvpnClient).where(
-            (OvpnClient.instance_id == instance_id) & (OvpnClient.revoked == False)
-        )
-    )
-    client_count = count_result.scalar() or 0
-    
     return {
         "success": True,
-        "message": "Routing mode updated",
+        "message": "Routing aggiornato. Le nuove rotte saranno attive alla prossima connessione dei client.",
         "tunnel_mode": instance.tunnel_mode,
-        "routes": instance.routes,
-        "warning": f"{client_count} clients need to re-download configuration" if client_count > 0 else None
+        "routes": instance.routes
     }
 
 
@@ -432,8 +439,8 @@ async def create_client(
     if not instance:
         raise HTTPException(404, "Instance not found")
     
-    # Validate name
-    if not re.match(r'^[a-zA-Z0-9_-]+$', data.name):
+    # Validate name (allow letters, numbers, dots, underscores, hyphens)
+    if not re.match(r'^[a-zA-Z0-9._-]+$', data.name):
         raise HTTPException(400, "Invalid client name")
     
     # Check if exists
@@ -507,10 +514,102 @@ async def revoke_client(
     # Delete CCD file
     openvpn_service.delete_ccd_file(instance_id, client_name)
     
+    # Remove from any group memberships (revoked clients shouldn't have firewall rules)
+    await db.execute(
+        OvpnGroupMember.__table__.delete().where(OvpnGroupMember.client_id == client.id)
+    )
+    
     # Mark as revoked
     client.revoked = True
     client.revoked_at = datetime.utcnow()
     await db.commit()
+    
+    # Reapply firewall rules (removes this client's jump rules)
+    await openvpn_service.apply_group_firewall_rules(instance_id, db)
+
+
+@router.delete("/instances/{instance_id}/clients/{client_name}/permanent", status_code=204)
+async def delete_client_permanent(
+    instance_id: str,
+    client_name: str,
+    db: AsyncSession = Depends(get_session),
+    _user: User = Depends(require_permission("openvpn.clients"))
+):
+    """Permanently delete a client (must be revoked first)."""
+    result = await db.execute(
+        select(OvpnClient).where(
+            (OvpnClient.instance_id == instance_id) &
+            (OvpnClient.name == client_name)
+        )
+    )
+    client = result.scalar_one_or_none()
+    if not client:
+        raise HTTPException(404, "Client not found")
+    
+    if not client.revoked:
+        raise HTTPException(400, "Client must be revoked before permanent deletion")
+    
+    # Remove from any group memberships
+    await db.execute(
+        OvpnGroupMember.__table__.delete().where(OvpnGroupMember.client_id == client.id)
+    )
+    
+    # Remove from database
+    await db.delete(client)
+    await db.commit()
+    
+    logger.info(f"Permanently deleted client {client_name} from instance {instance_id}")
+
+
+@router.post("/instances/{instance_id}/clients/{client_name}/restore")
+async def restore_client(
+    instance_id: str,
+    client_name: str,
+    db: AsyncSession = Depends(get_session),
+    _user: User = Depends(require_permission("openvpn.clients"))
+):
+    """Restore a revoked client by generating a new certificate."""
+    # Get instance
+    inst_result = await db.execute(select(OvpnInstance).where(OvpnInstance.id == instance_id))
+    instance = inst_result.scalar_one_or_none()
+    if not instance:
+        raise HTTPException(404, "Instance not found")
+    
+    # Get client
+    result = await db.execute(
+        select(OvpnClient).where(
+            (OvpnClient.instance_id == instance_id) &
+            (OvpnClient.name == client_name)
+        )
+    )
+    client = result.scalar_one_or_none()
+    if not client:
+        raise HTTPException(404, "Client not found")
+    
+    if not client.revoked:
+        raise HTTPException(400, "Client is not revoked")
+    
+    # Generate new certificate (this will create a new cert with same name)
+    cert_result = openvpn_service.generate_client_cert(instance_id, client_name, instance.cert_duration_days)
+    if not cert_result.get("success"):
+        raise HTTPException(500, f"Failed to generate new certificate: {cert_result.get('error')}")
+    
+    # Recreate CCD file for static IP
+    openvpn_service.create_ccd_file(instance_id, client_name, client.allocated_ip)
+    
+    # Update client record
+    client.revoked = False
+    client.revoked_at = None
+    client.cert_expiry = cert_result.get("expiry")
+    client.cert_fingerprint = cert_result.get("fingerprint")
+    await db.commit()
+    
+    return {
+        "success": True,
+        "message": "Client restored with new certificate",
+        "new_expiry": cert_result.get("expiry"),
+        "note": "Client must download the new configuration"
+    }
 
 
 @router.get("/instances/{instance_id}/clients/{client_name}/config")
@@ -540,14 +639,8 @@ async def get_client_config(
         raise HTTPException(404, "Client not found or revoked")
     
     # Determine endpoint
-    endpoint = instance.endpoint
-    if not endpoint:
-        # Try to detect public IP
-        import urllib.request
-        try:
-            endpoint = urllib.request.urlopen('https://api.ipify.org', timeout=5).read().decode()
-        except:
-            endpoint = "YOUR_SERVER_IP"
+    from .service import get_public_ip
+    endpoint = instance.endpoint or get_public_ip() or "YOUR_SERVER_IP"
     
     config = openvpn_service.generate_client_config(instance, client, endpoint)
     
@@ -655,6 +748,202 @@ async def renew_client_cert(
 
 
 # =========================================================================
+# CONFIG SHARING (EMAIL + MAGIC TOKEN)
+# =========================================================================
+
+@router.post("/instances/{instance_id}/clients/{client_name}/send-config")
+async def send_client_config_email(
+    instance_id: str,
+    client_name: str,
+    data: SendConfigRequest,
+    db: AsyncSession = Depends(get_session),
+    _user: User = Depends(require_permission("openvpn.clients"))
+):
+    """
+    Send client config via email with magic token link.
+    Token is valid for 48 hours and can only be used once.
+    """
+    from core.settings.models import SMTPSettings
+    from core.email import send_email
+    
+    # Get instance and client
+    result = await db.execute(select(OvpnInstance).where(OvpnInstance.id == instance_id))
+    instance = result.scalar_one_or_none()
+    if not instance:
+        raise HTTPException(404, "Instance not found")
+    
+    result = await db.execute(
+        select(OvpnClient).where(
+            (OvpnClient.instance_id == instance_id) & (OvpnClient.name == client_name)
+        )
+    )
+    client = result.scalar_one_or_none()
+    if not client:
+        raise HTTPException(404, "Client not found")
+    
+    if client.revoked:
+        raise HTTPException(400, "Cannot send config for revoked client")
+    
+    # Get SMTP settings
+    smtp_result = await db.execute(select(SMTPSettings).where(SMTPSettings.id == 1))
+    smtp_settings = smtp_result.scalar_one_or_none()
+    if not smtp_settings or not smtp_settings.smtp_host:
+        raise HTTPException(400, "SMTP non configurato. Configura prima le impostazioni email.")
+    
+    if not smtp_settings.public_url:
+        raise HTTPException(400, "URL pubblico non configurato nelle impostazioni SMTP.")
+    
+    # Generate magic token
+    token = secrets.token_urlsafe(32)
+    expires_at = datetime.utcnow() + timedelta(hours=48)
+    
+    magic_token = OvpnMagicToken(
+        token=token,
+        client_id=client.id,
+        expires_at=expires_at
+    )
+    db.add(magic_token)
+    await db.commit()
+    
+    # Build download URL
+    base_url = smtp_settings.public_url.rstrip('/')
+    download_url = f"{base_url}/api/modules/openvpn/download/{token}"
+    
+    # Send email
+    body_html = f"""
+    <html>
+    <body style="font-family: Arial, sans-serif; padding: 20px; background-color: #f5f5f5;">
+        <div style="max-width: 600px; margin: 0 auto; background: white; padding: 30px; border-radius: 8px;">
+            <h2 style="color: #ea580c;">🔐 Configurazione VPN OpenVPN</h2>
+            <p>Ciao,</p>
+            <p>Ecco il link per scaricare la tua configurazione VPN:</p>
+            <p style="text-align: center; margin: 30px 0;">
+                <a href="{download_url}" 
+                   style="background: #ea580c; color: white; padding: 12px 24px; 
+                          text-decoration: none; border-radius: 6px; font-weight: bold;">
+                    📥 Scarica Configurazione
+                </a>
+            </p>
+            <p><strong>Client:</strong> {client_name}</p>
+            <p><strong>Istanza:</strong> {instance.name}</p>
+            <hr style="border: none; border-top: 1px solid #e0e0e0; margin: 20px 0;">
+            <p style="color: #666; font-size: 12px;">
+                ⚠️ Questo link è valido per <strong>48 ore</strong> e può essere usato <strong>una sola volta</strong>.<br>
+                Dopo il download il link non sarà più utilizzabile.
+            </p>
+        </div>
+    </body>
+    </html>
+    """
+    
+    result = await send_email(
+        smtp_host=smtp_settings.smtp_host,
+        smtp_port=smtp_settings.smtp_port,
+        smtp_encryption=smtp_settings.smtp_encryption,
+        smtp_username=smtp_settings.smtp_username,
+        smtp_password=smtp_settings.smtp_password,
+        sender_email=smtp_settings.sender_email,
+        sender_name=smtp_settings.sender_name,
+        recipient_email=data.email,
+        subject=f"VPN Config - {client_name}",
+        body_html=body_html
+    )
+    
+    if not result.get("success"):
+        raise HTTPException(500, result.get("message", "Errore invio email"))
+    
+    return {"success": True, "message": f"Email inviata a {data.email}"}
+
+
+async def _validate_token(token: str, db: AsyncSession):
+    """
+    Validate magic token and return (magic_token, client, instance) or raise HTTPException.
+    Does NOT mark token as used.
+    """
+    result = await db.execute(select(OvpnMagicToken).where(OvpnMagicToken.token == token))
+    magic_token = result.scalar_one_or_none()
+    
+    if not magic_token:
+        raise HTTPException(404, "Link non valido o scaduto")
+    
+    if magic_token.used:
+        raise HTTPException(410, "Questo link è già stato utilizzato")
+    
+    if magic_token.expires_at < datetime.utcnow():
+        raise HTTPException(410, "Questo link è scaduto")
+    
+    result = await db.execute(select(OvpnClient).where(OvpnClient.id == magic_token.client_id))
+    client = result.scalar_one_or_none()
+    if not client:
+        raise HTTPException(404, "Client non trovato")
+    
+    result = await db.execute(select(OvpnInstance).where(OvpnInstance.id == client.instance_id))
+    instance = result.scalar_one_or_none()
+    if not instance:
+        raise HTTPException(404, "Istanza non trovata")
+    
+    return magic_token, client, instance
+
+
+@router.get("/download/{token}", response_class=HTMLResponse)
+async def download_landing_page(
+    token: str,
+    db: AsyncSession = Depends(get_session)
+):
+    """
+    Public landing page with setup instructions for OpenVPN.
+    Shows mobile/desktop tabs with download buttons.
+    """
+    from pathlib import Path
+    
+    magic_token, client, instance = await _validate_token(token, db)
+    
+    # Load and render template
+    template_path = Path(__file__).parent / "static" / "download_page.html"
+    html_content = template_path.read_text(encoding="utf-8")
+    
+    # Format expiry date
+    expires_str = magic_token.expires_at.strftime("%d/%m/%Y alle %H:%M")
+    
+    # Build URLs
+    base_path = f"/api/modules/openvpn/download/{token}"
+    
+    html_content = html_content.replace("{client_name}", client.name)
+    html_content = html_content.replace("{expires_at}", expires_str)
+    html_content = html_content.replace("{download_url}", f"{base_path}/file")
+    
+    return HTMLResponse(content=html_content)
+
+
+@router.get("/download/{token}/file")
+async def download_config_file(
+    token: str,
+    db: AsyncSession = Depends(get_session)
+):
+    """
+    Download the actual .ovpn file.
+    Marks the token as used after successful download.
+    """
+    from .service import get_public_ip
+    
+    magic_token, client, instance = await _validate_token(token, db)
+    
+    # Generate config
+    endpoint = instance.endpoint or get_public_ip() or "YOUR_SERVER_IP"
+    config = openvpn_service.generate_client_config(instance, client, endpoint)
+    
+    # Mark token as used
+    magic_token.used = True
+    await db.commit()
+    
+    return Response(
+        content=config,
+        media_type="text/plain",
+        headers={"Content-Disposition": f"attachment; filename={client.name}.ovpn"}
+    )
+
+
+# =========================================================================
 # GROUPS
 # =========================================================================
 
@@ -740,7 +1029,9 @@ async def delete_group(
     if not group:
         raise HTTPException(404, "Group not found")
     
-    # TODO: Remove firewall rules for this group
+    # IMPORTANT: Remove firewall rules BEFORE deleting from DB
+    # so we still have member info to remove jump rules
+    await openvpn_service.remove_group_firewall_rules(instance_id, group_id, group.name, db)
     
     await db.delete(group)
     await db.commit()
@@ -808,7 +1099,8 @@ async def add_member(
     db.add(member)
     await db.commit()
     
-    # TODO: Apply firewall rule for this member
+    # Apply firewall rules for this instance
+    await openvpn_service.apply_group_firewall_rules(instance_id, db)
     
     return {"success": True}
 
@@ -834,10 +1126,11 @@ async def remove_member(
     if not member:
         raise HTTPException(404, "Member not found")
     
-    # TODO: Remove firewall rule for this member
-    
     await db.delete(member)
     await db.commit()
+    
+    # Reapply firewall rules
+    await openvpn_service.apply_group_firewall_rules(instance_id, db)
 
 
 # =========================================================================
@@ -893,7 +1186,8 @@ async def create_rule(
     await db.commit()
     await db.refresh(rule)
     
-    # TODO: Apply firewall rule
+    # Apply firewall rules
+    await openvpn_service.apply_group_firewall_rules(instance_id, db)
     
     return OvpnGroupRuleRead(**rule.model_dump())
 
@@ -924,7 +1218,8 @@ async def update_rule(
     await db.commit()
     await db.refresh(rule)
     
-    # TODO: Reapply firewall rules
+    # Apply firewall rules
+    await openvpn_service.apply_group_firewall_rules(instance_id, db)
     
     return OvpnGroupRuleRead(**rule.model_dump())
 
@@ -947,10 +1242,11 @@ async def delete_rule(
     if not rule:
         raise HTTPException(404, "Rule not found")
     
-    # TODO: Remove firewall rule
-    
     await db.delete(rule)
     await db.commit()
+    
+    # Reapply firewall rules
+    await openvpn_service.apply_group_firewall_rules(instance_id, db)
 
 
 @router.put("/instances/{instance_id}/groups/{group_id}/rules/order")
@@ -972,7 +1268,8 @@ async def reorder_rules(
     
     await db.commit()
     
-    # TODO: Reapply firewall rules in new order
+    # Reapply firewall rules with new order
+    await openvpn_service.apply_group_firewall_rules(instance_id, db)
     
     return {"success": True}
 
@@ -1000,6 +1297,7 @@ async def update_firewall_policy(
     instance.firewall_default_policy = data.policy
     await db.commit()
     
-    # TODO: Reapply firewall rules with new default policy
+    # Reapply firewall rules with new policy
+    await openvpn_service.apply_group_firewall_rules(instance_id, db)
     
     return {"success": True, "policy": data.policy}

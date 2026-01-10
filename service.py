@@ -8,6 +8,7 @@ import subprocess
 import logging
 import re
 import shutil
+import urllib.request
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 from datetime import datetime, timedelta
@@ -22,6 +23,41 @@ logger = logging.getLogger(__name__)
 # Paths
 OPENVPN_BASE_DIR = Path("/etc/openvpn/server")
 EASYRSA_SOURCE = Path("/usr/share/easy-rsa")
+
+# Cached public IP
+_cached_public_ip = None
+
+
+def get_public_ip() -> Optional[str]:
+    """
+    Get server's public IP address.
+    Tries multiple services, caches result.
+    """
+    global _cached_public_ip
+    if _cached_public_ip:
+        return _cached_public_ip
+    
+    services = [
+        "https://api.ipify.org",
+        "https://icanhazip.com",
+        "https://checkip.amazonaws.com",
+        "https://ifconfig.me/ip"
+    ]
+    
+    for url in services:
+        try:
+            with urllib.request.urlopen(url, timeout=5) as response:
+                ip = response.read().decode('utf-8').strip()
+                if ip:
+                    _cached_public_ip = ip
+                    logger.info(f"Detected public IP: {ip}")
+                    return ip
+        except Exception as e:
+            logger.debug(f"Failed to get IP from {url}: {e}")
+            continue
+    
+    logger.warning("Could not detect public IP from any service")
+    return None
 
 
 class OpenVPNService:
@@ -417,6 +453,7 @@ class OpenVPNService:
             f"key {instance_dir}/server.key",
             f"crl-verify {instance_dir}/crl.pem",
             f"tls-crypt-v2 {instance_dir}/tls-crypt-v2.key",
+            "dh none",  # Use ECDH instead of DH parameters
             "",
             f"server {network.network_address} {network.netmask}",
             f"topology subnet",
@@ -444,7 +481,8 @@ class OpenVPNService:
         ]
         
         # DNS servers
-        for dns in instance.dns_servers:
+        dns_servers = instance.dns_servers if instance.dns_servers else ["8.8.8.8", "1.1.1.1"]
+        for dns in dns_servers:
             config_lines.append(f'push "dhcp-option DNS {dns}"')
         
         # Routing
@@ -699,15 +737,40 @@ class OpenVPNService:
     
     @staticmethod
     def _ensure_jump_rule(source_chain: str, target_chain: str, table: str = "filter") -> bool:
-        """Ensure a jump rule exists from source to target chain."""
-        # Check if rule exists
+        """Ensure a jump rule exists from source to target chain.
+        
+        Inserts the jump BEFORE any RETURN rule to ensure proper ordering.
+        """
+        # Check if rule already exists
         result = subprocess.run(
             ["iptables", "-t", table, "-C", source_chain, "-j", target_chain],
             capture_output=True
         )
-        if result.returncode != 0:
+        if result.returncode == 0:
+            return True  # Already exists
+        
+        # Find position of RETURN rule (if any) to insert before it
+        result = subprocess.run(
+            ["iptables", "-t", table, "-S", source_chain],
+            capture_output=True,
+            text=True
+        )
+        
+        # Parse rules to find RETURN position
+        lines = result.stdout.strip().split('\n') if result.returncode == 0 else []
+        return_pos = None
+        for i, line in enumerate(lines):
+            if '-j RETURN' in line:
+                return_pos = i
+                break
+        
+        if return_pos is not None:
+            # Insert before RETURN
+            return OpenVPNService._run_iptables(table, ["-I", source_chain, str(return_pos), "-j", target_chain])
+        else:
+            # No RETURN, just append
             return OpenVPNService._run_iptables(table, ["-A", source_chain, "-j", target_chain])
-        return True
+
     
     @staticmethod
     def _delete_chain(chain_name: str, table: str = "filter") -> bool:
@@ -741,7 +804,8 @@ class OpenVPNService:
         routes: list = None
     ) -> bool:
         """Apply firewall rules for an OpenVPN instance."""
-        OpenVPNService.initialize_module_firewall_chains()
+        # Note: Module chains (MOD_OVPN_*) are created by core via manifest.json
+        # We only create instance-specific chains here
         
         chain_id = instance_id.replace('tun', '') if instance_id.startswith('tun') else instance_id
         input_chain = f"OVPN_{chain_id}_INPUT"
@@ -841,7 +905,178 @@ class OpenVPNService:
         
         logger.info(f"Firewall rules removed for instance {instance_id}")
         return True
+    
+    @staticmethod
+    async def remove_all_group_chains(instance_id: str, db) -> bool:
+        """
+        Remove all group chains for an instance.
+        Should be called before deleting an instance.
+        """
+        from .models import OvpnGroup
+        
+        logger.info(f"Removing group chains for instance {instance_id}")
+        
+        # Get all groups for this instance
+        result = await db.execute(select(OvpnGroup).where(OvpnGroup.instance_id == instance_id))
+        groups = result.scalars().all()
+        
+        for group in groups:
+            group_chain = f"OVPN_GRP_{group.id.replace(instance_id + '_', '')}"
+            OpenVPNService._delete_chain(group_chain, "filter")
+            logger.info(f"  Deleted chain: {group_chain}")
+        
+        return True
+    
+    @staticmethod
+    async def apply_group_firewall_rules(instance_id: str, db) -> bool:
+        """
+        Apply firewall rules for all groups in an instance.
+        
+        Chain hierarchy:
+        OVPN_{instance}_FWD → OVPN_GRP_{group_id} → rules → default policy
+        
+        For each group member, traffic from their IP is matched and jumped
+        to the group's chain where rules are applied.
+        """
+        from .models import OvpnInstance, OvpnGroup, OvpnGroupMember, OvpnGroupRule, OvpnClient
+        
+        logger.info(f"Applying group firewall rules for instance {instance_id}")
+        
+        # Get instance
+        result = await db.execute(select(OvpnInstance).where(OvpnInstance.id == instance_id))
+        instance = result.scalar_one_or_none()
+        if not instance:
+            logger.error(f"Instance {instance_id} not found")
+            return False
+        
+        # Instance forward chain name
+        chain_id = instance_id.replace('tun', '') if instance_id.startswith('tun') else instance_id
+        instance_fwd_chain = f"OVPN_{chain_id}_FWD"
+        
+        # Get all groups for this instance
+        result = await db.execute(select(OvpnGroup).where(OvpnGroup.instance_id == instance_id))
+        groups = result.scalars().all()
+        
+        for group in groups:
+            group_chain = f"OVPN_GRP_{group.id.replace(instance_id + '_', '')}"
+            
+            # Create group chain
+            OpenVPNService._create_or_flush_chain(group_chain, "filter")
+            
+            # Get rules for this group (ordered)
+            result = await db.execute(
+                select(OvpnGroupRule)
+                .where(OvpnGroupRule.group_id == group.id)
+                .order_by(OvpnGroupRule.order)
+            )
+            rules = result.scalars().all()
+            
+            # Add rules to group chain
+            for rule in rules:
+                args = ["-A", group_chain]
+                
+                # Protocol
+                if rule.protocol and rule.protocol != "all":
+                    args.extend(["-p", rule.protocol])
+                
+                # Destination
+                if rule.destination and rule.destination != "0.0.0.0/0":
+                    args.extend(["-d", rule.destination])
+                
+                # Port (only for tcp/udp)
+                if rule.port and rule.protocol in ("tcp", "udp"):
+                    args.extend(["--dport", rule.port])
+                
+                # Action
+                args.extend(["-j", rule.action])
+                
+                OpenVPNService._run_iptables("filter", args)
+            
+            # Group chain ends with RETURN - default policy is at instance level
+            OpenVPNService._run_iptables("filter", [
+                "-A", group_chain, "-j", "RETURN"
+            ])
+            
+            # Get members of this group
+            result = await db.execute(
+                select(OvpnGroupMember, OvpnClient)
+                .join(OvpnClient, OvpnGroupMember.client_id == OvpnClient.id)
+                .where(OvpnGroupMember.group_id == group.id)
+            )
+            members = result.all()
+            
+            # For each member, add a jump rule from instance chain to group chain
+            for member, client in members:
+                client_ip = client.allocated_ip.split('/')[0]  # Remove /32
+                
+                # Add jump rule matching source IP at beginning of instance chain
+                # First remove any existing rule for this IP
+                OpenVPNService._run_iptables("filter", [
+                    "-D", instance_fwd_chain, "-s", client_ip, "-j", group_chain
+                ], suppress_errors=True)
+                
+                # Insert at position 1 (before the default ACCEPT rules)
+                OpenVPNService._run_iptables("filter", [
+                    "-I", instance_fwd_chain, "1", "-s", client_ip, "-j", group_chain
+                ])
+                
+                logger.info(f"  Added rule: {client_ip} -> {group_chain}")
+        
+        # After processing all groups, update the instance forward chain to use the default policy
+        # Remove old generic rules (they'll be at the end)
+        OpenVPNService._run_iptables("filter", [
+            "-D", instance_fwd_chain, "-j", "ACCEPT"
+        ], suppress_errors=True)
+        OpenVPNService._run_iptables("filter", [
+            "-D", instance_fwd_chain, "-j", "RETURN"
+        ], suppress_errors=True)
+        OpenVPNService._run_iptables("filter", [
+            "-D", instance_fwd_chain, "-j", "DROP"
+        ], suppress_errors=True)
+        
+        # Add the instance default policy at the end (for non-grouped clients)
+        OpenVPNService._run_iptables("filter", [
+            "-A", instance_fwd_chain, "-j", instance.firewall_default_policy
+        ])
+        
+        logger.info(f"Group firewall rules applied for instance {instance_id}")
+        logger.info(f"  Default policy for non-grouped clients: {instance.firewall_default_policy}")
+        return True
+    
+    @staticmethod
+    async def remove_group_firewall_rules(instance_id: str, group_id: str, group_name: str, db) -> bool:
+        """Remove firewall rules for a specific group."""
+        from .models import OvpnGroupMember, OvpnClient
+        
+        # Instance forward chain name
+        chain_id = instance_id.replace('tun', '') if instance_id.startswith('tun') else instance_id
+        instance_fwd_chain = f"OVPN_{chain_id}_FWD"
+        group_chain = f"OVPN_GRP_{group_name}"
+        
+        logger.info(f"Removing firewall rules for group {group_name} (chain: {group_chain})")
+        
+        # Get members to remove their jump rules
+        result = await db.execute(
+            select(OvpnGroupMember, OvpnClient)
+            .join(OvpnClient, OvpnGroupMember.client_id == OvpnClient.id)
+            .where(OvpnGroupMember.group_id == group_id)
+        )
+        members = result.all()
+        
+        for member, client in members:
+            client_ip = client.allocated_ip.split('/')[0] + "/32"
+            logger.info(f"  Removing jump rule: {client_ip} -> {group_chain}")
+            OpenVPNService._run_iptables("filter", [
+                "-D", instance_fwd_chain, "-s", client_ip, "-j", group_chain
+            ], suppress_errors=True)
+        
+        # Delete group chain
+        logger.info(f"  Deleting chain: {group_chain}")
+        OpenVPNService._delete_chain(group_chain, "filter")
+        
+        return True
 
 
 # Module instance
 openvpn_service = OpenVPNService()
+

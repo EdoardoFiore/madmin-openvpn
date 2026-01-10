@@ -1,7 +1,7 @@
 {
     "id": "openvpn",
     "name": "OpenVPN Manager",
-    "version": "0.1.2",
+    "version": "0.2.0",
     "description": "OpenVPN server and client management with PKI, certificate generation, and multi-instance support",
     "author": "MADMIN Team",
     "system_dependencies": {
@@ -49,19 +49,19 @@
     "menu": [
         {
             "label": "OpenVPN",
-            "icon": "lock",
+            "icon": "https://www.svgrepo.com/show/504696/openvpn.svg",
             "route": "#openvpn"
         }
     ],
     "firewall_chains": [
         {
             "name": "MOD_OVPN_INPUT",
-            "parent": "MADMIN_INPUT",
+            "parent": "INPUT",
             "priority": 50
         },
         {
             "name": "MOD_OVPN_FORWARD",
-            "parent": "MADMIN_FORWARD",
+            "parent": "FORWARD",
             "priority": 50
         }
     ],

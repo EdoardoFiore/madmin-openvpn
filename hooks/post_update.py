@@ -10,7 +10,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-def run():
+async def run():
     """Post-update hook for OpenVPN module."""
     logger.info("Running OpenVPN post-update hook")
     

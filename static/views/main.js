@@ -1,620 +1,879 @@
 /**
- * OpenVPN Module - Frontend
+ * OpenVPN Module - Main View
  * 
- * Main view for OpenVPN management:
- * - Instances list and CRUD
- * - Clients management with certificate status
- * - PKI management (certificate renewal)
- * - Firewall groups
+ * Complete management UI for OpenVPN VPN instances and clients.
+ * Layout matches WireGuard module for consistency.
  */
 
-const MODULE_BASE = '/api/modules/openvpn';
+import { apiGet, apiPost, apiDelete, apiPatch } from '/static/js/api.js';
+import { showToast, confirmDialog, loadingSpinner } from '/static/js/utils.js';
+import { checkPermission } from '/static/js/app.js';
 
-// Global state
-let currentInstance = null;
-let networkInterfaces = [];
+const MODULE_API = '/modules/openvpn';
 
-/**
- * Initialize the OpenVPN module view
- */
-async function init() {
-    renderMainView();
-    await loadInstances();
-    setupEventListeners();
+let currentInstanceId = null;
+let networkInterfaces = [];  // Cache for system network interfaces
+let canManage = false;  // Permission cache
+let canClients = false;
+
+// Helper function to format bytes to human readable string
+function formatBytes(bytes) {
+    if (bytes === 0) return '0 B';
+    const k = 1024;
+    const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
 }
 
-/**
- * Render the main container
- */
-function renderMainView() {
-    const container = document.getElementById('module-content');
+// Helper function to format ISO timestamp to "X ago" format
+function formatTimeAgo(isoString) {
+    if (!isoString) return 'Mai';
+    const date = new Date(isoString);
+    const now = new Date();
+    const diffMs = now - date;
+    const diffSec = Math.floor(diffMs / 1000);
+
+    if (diffSec < 60) return 'Adesso';
+    if (diffSec < 3600) return `${Math.floor(diffSec / 60)} min fa`;
+    if (diffSec < 86400) return `${Math.floor(diffSec / 3600)} ore fa`;
+    if (diffSec < 604800) return `${Math.floor(diffSec / 86400)} giorni fa`;
+    return date.toLocaleDateString('it-IT');
+}
+
+// Helper function to escape HTML
+function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+}
+
+export async function render(container, params) {
+    // Cache permissions
+    canManage = checkPermission('openvpn.manage');
+    canClients = checkPermission('openvpn.clients');
+
+    if (params && params.length > 0) {
+        currentInstanceId = params[0];
+        await renderInstanceDetail(container);
+    } else {
+        await renderInstanceList(container);
+    }
+}
+
+// ============== INSTANCE LIST ==============
+
+async function renderInstanceList(container) {
     container.innerHTML = `
-        <div class="page-header d-print-none mb-4">
-            <div class="row align-items-center">
-                <div class="col-auto">
-                    <h2 class="page-title">
-                        <i class="ti ti-lock me-2"></i>
-                        OpenVPN Manager
-                    </h2>
-                </div>
-                <div class="col-auto ms-auto">
-                    <button class="btn btn-primary" id="btn-create-instance">
-                        <i class="ti ti-plus me-2"></i>Nuova Istanza
-                    </button>
-                </div>
+        <div class="card">
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <h3 class="card-title"><i class="ti ti-lock me-2"></i>Istanze OpenVPN</h3>
+                ${canManage ? `
+                <button class="btn btn-primary" id="btn-new-instance">
+                    <i class="ti ti-plus me-1"></i>Nuova Istanza
+                </button>` : ''}
             </div>
+            <div class="card-body" id="instances-list">${loadingSpinner()}</div>
         </div>
         
-        <div id="instances-container">
-            <div class="text-center py-5">
-                <div class="spinner-border text-primary"></div>
-                <p class="text-muted mt-2">Caricamento istanze...</p>
-            </div>
-        </div>
-        
-        <!-- Instance Detail Modal -->
-        <div class="modal modal-blur fade" id="modal-instance-detail" tabindex="-1">
-            <div class="modal-dialog modal-xl">
-                <div class="modal-content">
-                    <div class="modal-header">
-                        <h5 class="modal-title" id="modal-instance-title">Dettaglio Istanza</h5>
-                        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
-                    </div>
-                    <div class="modal-body" id="modal-instance-body">
-                        <!-- Instance details are rendered here -->
-                    </div>
-                </div>
-            </div>
-        </div>
-        
-        <!-- Create Instance Modal -->
-        <div class="modal modal-blur fade" id="modal-create-instance" tabindex="-1">
+        <!-- New Instance Modal -->
+        <div class="modal fade" id="modal-new-instance" tabindex="-1">
             <div class="modal-dialog modal-lg">
                 <div class="modal-content">
                     <div class="modal-header">
-                        <h5 class="modal-title">Crea Nuova Istanza OpenVPN</h5>
+                        <h5 class="modal-title">Nuova Istanza OpenVPN</h5>
                         <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
                     </div>
                     <div class="modal-body">
-                        <form id="form-create-instance">
-                            <div class="row">
-                                <div class="col-md-6 mb-3">
-                                    <label class="form-label">Nome Istanza</label>
-                                    <input type="text" class="form-control" name="name" required 
-                                           placeholder="es. office, remote">
+                        <div class="row">
+                            <div class="col-md-6 mb-3">
+                                <label class="form-label">Nome</label>
+                                <input type="text" class="form-control" id="new-instance-name" placeholder="Office VPN">
+                            </div>
+                            <div class="col-md-3 mb-3">
+                                <label class="form-label">Porta</label>
+                                <input type="number" class="form-control" id="new-instance-port" value="1194">
+                            </div>
+                            <div class="col-md-3 mb-3">
+                                <label class="form-label">Protocollo</label>
+                                <select class="form-select" id="new-instance-protocol">
+                                    <option value="udp" selected>UDP</option>
+                                    <option value="tcp">TCP</option>
+                                </select>
+                            </div>
+                        </div>
+                        
+                        <div class="row">
+                            <div class="col-md-6 mb-3">
+                                <label class="form-label">Subnet VPN</label>
+                                <input type="text" class="form-control" id="new-instance-subnet" placeholder="10.8.0.0/24">
+                            </div>
+                            <div class="col-md-6 mb-3">
+                                <label class="form-label">Endpoint (IP/Domain pubblico)</label>
+                                <input type="text" class="form-control" id="new-instance-endpoint" placeholder="Lascia vuoto per auto-detect">
+                            </div>
+                        </div>
+                        
+                        <div class="mb-3">
+                            <label class="form-label">Modalità Tunnel</label>
+                            <div class="row g-2">
+                                <div class="col-6">
+                                    <input type="radio" class="btn-check" name="tunnel-mode" id="tunnel-full" value="full" checked>
+                                    <label class="btn btn-outline-primary w-100 text-start py-2 d-block" for="tunnel-full">
+                                        <i class="ti ti-world me-2"></i><strong>Full Tunnel</strong><br>
+                                        <small class="opacity-75">Tutto il traffico passa dalla VPN</small>
+                                    </label>
                                 </div>
-                                <div class="col-md-3 mb-3">
-                                    <label class="form-label">Porta</label>
-                                    <input type="number" class="form-control" name="port" 
-                                           value="1194" min="1" max="65535" required>
-                                </div>
-                                <div class="col-md-3 mb-3">
-                                    <label class="form-label">Protocollo</label>
-                                    <select class="form-select" name="protocol">
-                                        <option value="udp" selected>UDP</option>
-                                        <option value="tcp">TCP</option>
-                                    </select>
+                                <div class="col-6">
+                                    <input type="radio" class="btn-check" name="tunnel-mode" id="tunnel-split" value="split">
+                                    <label class="btn btn-outline-primary w-100 text-start py-2 d-block" for="tunnel-split">
+                                        <i class="ti ti-route me-2"></i><strong>Split Tunnel</strong><br>
+                                        <small class="opacity-75">Solo reti specifiche via VPN</small>
+                                    </label>
                                 </div>
                             </div>
-                            
-                            <div class="row">
-                                <div class="col-md-6 mb-3">
-                                    <label class="form-label">Subnet VPN</label>
-                                    <input type="text" class="form-control" name="subnet" 
-                                           value="10.8.0.0/24" required placeholder="es. 10.8.0.0/24">
-                                </div>
-                                <div class="col-md-6 mb-3">
-                                    <label class="form-label">Endpoint (IP/Domain pubblico)</label>
-                                    <input type="text" class="form-control" name="endpoint" 
-                                           placeholder="Lascia vuoto per auto-detect">
-                                </div>
-                            </div>
-                            
+                        </div>
+                        
+                        <!-- Full Tunnel Options -->
+                        <div id="full-tunnel-options">
                             <div class="mb-3">
-                                <label class="form-label">Modalità Tunnel</label>
-                                <div class="row g-2">
-                                    <div class="col-6">
-                                        <input type="radio" class="btn-check" name="tunnel_mode" 
-                                               id="tunnel-full" value="full" checked>
-                                        <label class="btn btn-outline-primary w-100 text-start py-2 d-block" 
-                                               for="tunnel-full">
-                                            <i class="ti ti-world me-2"></i><strong>Full Tunnel</strong><br>
-                                            <small class="opacity-75">Tutto il traffico passa dalla VPN</small>
-                                        </label>
-                                    </div>
-                                    <div class="col-6">
-                                        <input type="radio" class="btn-check" name="tunnel_mode" 
-                                               id="tunnel-split" value="split">
-                                        <label class="btn btn-outline-primary w-100 text-start py-2 d-block" 
-                                               for="tunnel-split">
-                                            <i class="ti ti-route me-2"></i><strong>Split Tunnel</strong><br>
-                                            <small class="opacity-75">Solo reti specifiche via VPN</small>
-                                        </label>
-                                    </div>
-                                </div>
+                                <label class="form-label">Server DNS</label>
+                                <input type="text" class="form-control" id="new-instance-dns" 
+                                       placeholder="8.8.8.8, 1.1.1.1" value="8.8.8.8, 1.1.1.1">
+                                <small class="form-hint">Separati da virgola. Lascia vuoto per usare Google DNS.</small>
                             </div>
-                            
-                            <!-- Split tunnel routes -->
-                            <div id="split-tunnel-options" class="d-none mb-3">
-                                <label class="form-label">Reti da instradare</label>
-                                <div id="routes-list">
-                                    <div class="route-row mb-2 d-flex gap-2">
-                                        <input type="text" class="form-control route-input" 
-                                               placeholder="es. 192.168.1.0/24">
-                                        <button type="button" class="btn btn-outline-danger btn-remove-route">
-                                            <i class="ti ti-trash"></i>
+                        </div>
+                        
+                        <!-- Split Tunnel Options -->
+                        <div id="split-tunnel-options" style="display: none;">
+                            <div class="mb-3">
+                                <label class="form-label">Rotte da inoltrare</label>
+                                <div id="routes-container">
+                                    <div class="route-row mb-2 d-flex gap-2 align-items-center">
+                                        <input type="text" class="form-control route-network" placeholder="192.168.1.0/24" style="flex: 2">
+                                        <button class="btn btn-outline-success btn-add-route" type="button">
+                                            <i class="ti ti-plus"></i>
                                         </button>
                                     </div>
                                 </div>
-                                <button type="button" class="btn btn-outline-secondary btn-sm" id="btn-add-route">
-                                    <i class="ti ti-plus me-1"></i>Aggiungi Rete
-                                </button>
+                                <small class="form-hint">Subnet da instradare tramite VPN.</small>
                             </div>
-                            
-                            <!-- Full tunnel options -->
-                            <div id="full-tunnel-options" class="mb-3">
-                                <label class="form-label">Server DNS</label>
-                                <input type="text" class="form-control" name="dns_servers" 
-                                       value="8.8.8.8, 1.1.1.1" placeholder="Separati da virgola">
+                            <div class="mb-3">
+                                <label class="form-label">Server DNS (opzionale)</label>
+                                <input type="text" class="form-control" id="new-instance-dns-split" placeholder="Lascia vuoto per usare DNS locali">
                             </div>
-                            
-                            <!-- Advanced options -->
-                            <details class="mb-3">
-                                <summary class="text-muted cursor-pointer">
-                                    <i class="ti ti-settings me-1"></i>Opzioni Avanzate
-                                </summary>
-                                <div class="mt-3 ps-3">
-                                    <div class="row">
-                                        <div class="col-md-6 mb-3">
-                                            <label class="form-label">Cipher</label>
-                                            <select class="form-select" name="cipher">
-                                                <option value="AES-256-GCM" selected>AES-256-GCM (raccomandato)</option>
-                                                <option value="AES-128-GCM">AES-128-GCM</option>
-                                                <option value="CHACHA20-POLY1305">CHACHA20-POLY1305</option>
-                                            </select>
-                                        </div>
-                                        <div class="col-md-6 mb-3">
-                                            <label class="form-label">Durata Certificati (giorni)</label>
-                                            <input type="number" class="form-control" name="cert_duration_days" 
-                                                   value="3650" min="365" max="36500">
-                                            <small class="text-muted">Default: 10 anni</small>
-                                        </div>
+                        </div>
+                        
+                        <!-- Advanced options -->
+                        <details class="mb-3">
+                            <summary class="text-muted cursor-pointer">
+                                <i class="ti ti-settings me-1"></i>Opzioni Avanzate
+                            </summary>
+                            <div class="mt-3 ps-3">
+                                <div class="row">
+                                    <div class="col-md-6 mb-3">
+                                        <label class="form-label">Cipher</label>
+                                        <select class="form-select" id="new-instance-cipher">
+                                            <option value="AES-256-GCM" selected>AES-256-GCM (raccomandato)</option>
+                                            <option value="AES-128-GCM">AES-128-GCM</option>
+                                            <option value="CHACHA20-POLY1305">CHACHA20-POLY1305</option>
+                                        </select>
+                                    </div>
+                                    <div class="col-md-6 mb-3">
+                                        <label class="form-label">Durata Certificati (giorni)</label>
+                                        <input type="number" class="form-control" id="new-instance-cert-days" 
+                                               value="3650" min="365" max="36500">
+                                        <small class="form-hint">Default: 10 anni</small>
                                     </div>
                                 </div>
-                            </details>
-                        </form>
+                            </div>
+                        </details>
                     </div>
                     <div class="modal-footer">
-                        <button type="button" class="btn" data-bs-dismiss="modal">Annulla</button>
-                        <button type="button" class="btn btn-primary" id="btn-save-instance">
+                        <button class="btn btn-outline-secondary" data-bs-dismiss="modal">Annulla</button>
+                        <button class="btn btn-primary" id="btn-create-instance">
                             <i class="ti ti-check me-1"></i>Crea Istanza
                         </button>
                     </div>
                 </div>
             </div>
         </div>
-        
-        <!-- Create Client Modal -->
-        <div class="modal modal-blur fade" id="modal-create-client" tabindex="-1">
-            <div class="modal-dialog">
-                <div class="modal-content">
-                    <div class="modal-header">
-                        <h5 class="modal-title">Nuovo Client</h5>
-                        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
-                    </div>
-                    <div class="modal-body">
-                        <form id="form-create-client">
-                            <div class="mb-3">
-                                <label class="form-label">Nome Client</label>
-                                <input type="text" class="form-control" name="name" required 
-                                       pattern="[a-zA-Z0-9_-]+" placeholder="es. laptop_mario">
-                                <small class="text-muted">Solo lettere, numeri, - e _</small>
-                            </div>
-                            <div class="mb-3">
-                                <label class="form-label">Durata Certificato (giorni)</label>
-                                <input type="number" class="form-control" name="cert_duration_days" 
-                                       placeholder="Lascia vuoto per usare default istanza">
-                            </div>
-                        </form>
-                    </div>
-                    <div class="modal-footer">
-                        <button type="button" class="btn" data-bs-dismiss="modal">Annulla</button>
-                        <button type="button" class="btn btn-primary" id="btn-save-client">
-                            <i class="ti ti-check me-1"></i>Crea Client
-                        </button>
-                    </div>
-                </div>
-            </div>
-        </div>
     `;
+
+    await loadInstances();
+    setupCreateForm();
 }
 
-/**
- * Load and display instances
- */
-async function loadInstances() {
-    try {
-        const response = await fetch(`${MODULE_BASE}/instances`);
-        const instances = await response.json();
+async function setupCreateForm() {
+    document.getElementById('btn-new-instance')?.addEventListener('click', async () => {
+        new bootstrap.Modal(document.getElementById('modal-new-instance')).show();
+    });
 
-        const container = document.getElementById('instances-container');
+    // Toggle tunnel options
+    document.querySelectorAll('input[name="tunnel-mode"]').forEach(radio => {
+        radio.addEventListener('change', (e) => {
+            const fullOpts = document.getElementById('full-tunnel-options');
+            const splitOpts = document.getElementById('split-tunnel-options');
+            if (e.target.value === 'full') {
+                fullOpts.style.display = 'block';
+                splitOpts.style.display = 'none';
+            } else {
+                fullOpts.style.display = 'none';
+                splitOpts.style.display = 'block';
+            }
+        });
+    });
+
+    // Add route button
+    document.querySelector('.btn-add-route')?.addEventListener('click', addRouteInput);
+
+    document.getElementById('btn-create-instance')?.addEventListener('click', createInstance);
+}
+
+function addRouteInput() {
+    const container = document.getElementById('routes-container');
+    const div = document.createElement('div');
+    div.className = 'route-row mb-2 d-flex gap-2 align-items-center';
+    div.innerHTML = `
+        <input type="text" class="form-control route-network" placeholder="192.168.1.0/24" style="flex: 2">
+        <button class="btn btn-outline-danger btn-remove-route" type="button">
+            <i class="ti ti-minus"></i>
+        </button>
+    `;
+    div.querySelector('.btn-remove-route').addEventListener('click', () => div.remove());
+    container.appendChild(div);
+}
+
+async function loadInstances() {
+    const listEl = document.getElementById('instances-list');
+    try {
+        const instances = await apiGet(`${MODULE_API}/instances`);
 
         if (instances.length === 0) {
-            container.innerHTML = `
-                <div class="card">
-                    <div class="card-body text-center py-5">
-                        <div class="mb-3">
-                            <i class="ti ti-lock" style="font-size: 48px; opacity: 0.5;"></i>
-                        </div>
-                        <h3>Nessuna istanza OpenVPN</h3>
-                        <p class="text-muted">Crea la tua prima istanza VPN per iniziare</p>
-                        <button class="btn btn-primary" onclick="document.getElementById('btn-create-instance').click()">
-                            <i class="ti ti-plus me-2"></i>Crea Istanza
-                        </button>
-                    </div>
-                </div>
-            `;
+            listEl.innerHTML = `<div class="text-center py-5 text-muted">
+                <i class="ti ti-server-off" style="font-size: 3rem;"></i>
+                <p class="mt-2">Nessuna istanza configurata</p>
+                <small>Clicca "Nuova Istanza" per crearne una</small>
+            </div>`;
             return;
         }
 
-        container.innerHTML = `
-            <div class="row row-cards">
-                ${instances.map(inst => renderInstanceCard(inst)).join('')}
-            </div>
-        `;
-    } catch (error) {
-        console.error('Error loading instances:', error);
-        showToast('Errore nel caricamento delle istanze', 'danger');
+        listEl.innerHTML = `<div class="table-responsive"><table class="table table-vcenter card-table">
+            <thead><tr>
+                <th>Nome</th><th>Interfaccia</th><th>Porta</th><th>Subnet</th>
+                <th>Modalità</th><th>Client</th><th>Stato</th><th class="w-1"></th>
+            </tr></thead>
+            <tbody>${instances.map(i => `<tr>
+                <td><a href="#openvpn/${i.id}" class="text-reset"><strong>${escapeHtml(i.name)}</strong></a></td>
+                <td><code>${i.interface}</code></td>
+                <td>${i.port}/${i.protocol.toUpperCase()}</td>
+                <td><code>${i.subnet}</code></td>
+                <td><span class="badge ${i.tunnel_mode === 'full' ? 'bg-blue' : 'bg-purple'}-lt">
+                    ${i.tunnel_mode === 'full' ? 'Full' : 'Split'}
+                </span></td>
+                <td>${i.client_count}</td>
+                <td><span class="badge ${i.status === 'running' ? 'bg-success' : 'bg-secondary'}">
+                    ${i.status === 'running' ? 'Attivo' : 'Fermo'}
+                </span></td>
+                <td><div class="btn-group">
+                    ${canManage ? (i.status === 'running'
+                ? `<button class="btn btn-sm btn-ghost-warning" onclick="stopInstance('${i.id}')" title="Ferma"><i class="ti ti-player-stop"></i></button>`
+                : `<button class="btn btn-sm btn-ghost-success" onclick="startInstance('${i.id}')" title="Avvia"><i class="ti ti-player-play"></i></button>`) : ''}
+                    <a href="#openvpn/${i.id}" class="btn btn-sm btn-ghost-primary" title="Dettagli"><i class="ti ti-eye"></i></a>
+                    ${canManage ? `<button class="btn btn-sm btn-ghost-danger" onclick="deleteInstance('${i.id}')" title="Elimina"><i class="ti ti-trash"></i></button>` : ''}
+                </div></td>
+            </tr>`).join('')}</tbody>
+        </table></div>`;
+    } catch (err) {
+        listEl.innerHTML = `<div class="alert alert-danger">${err.message}</div>`;
     }
 }
 
-/**
- * Render instance card
- */
-function renderInstanceCard(instance) {
-    const isRunning = instance.status === 'running';
-    const certWarning = instance.server_cert_expiry &&
-        getDaysRemaining(instance.server_cert_expiry) < 30;
+async function createInstance() {
+    const name = document.getElementById('new-instance-name').value.trim();
+    const port = parseInt(document.getElementById('new-instance-port').value);
+    const protocol = document.getElementById('new-instance-protocol').value;
+    const subnet = document.getElementById('new-instance-subnet').value.trim();
+    const endpoint = document.getElementById('new-instance-endpoint').value.trim() || null;
+    const tunnelMode = document.querySelector('input[name="tunnel-mode"]:checked').value;
+    const cipher = document.getElementById('new-instance-cipher').value;
+    const certDays = parseInt(document.getElementById('new-instance-cert-days').value) || 3650;
 
-    return `
-        <div class="col-md-6 col-lg-4">
-            <div class="card">
-                <div class="card-status-top ${isRunning ? 'bg-success' : 'bg-secondary'}"></div>
+    if (!name || !port || !subnet) {
+        showToast('Compila tutti i campi obbligatori', 'error');
+        return;
+    }
+
+    // Collect DNS servers
+    let dnsInput = tunnelMode === 'full'
+        ? document.getElementById('new-instance-dns').value
+        : document.getElementById('new-instance-dns-split').value;
+
+    let dnsServers = dnsInput.split(',').map(s => s.trim()).filter(s => s);
+    if (dnsServers.length === 0 && tunnelMode === 'full') {
+        dnsServers = ['8.8.8.8', '1.1.1.1'];
+    }
+
+    // Collect routes for split tunnel
+    let routes = [];
+    if (tunnelMode === 'split') {
+        document.querySelectorAll('.route-row').forEach(row => {
+            const network = row.querySelector('.route-network')?.value.trim();
+            if (network) {
+                routes.push({ network });
+            }
+        });
+    }
+
+    try {
+        await apiPost(`${MODULE_API}/instances`, {
+            name, port, protocol, subnet, endpoint,
+            tunnel_mode: tunnelMode,
+            dns_servers: dnsServers,
+            routes: routes,
+            cipher: cipher,
+            cert_duration_days: certDays
+        });
+        showToast('Istanza creata con successo', 'success');
+        bootstrap.Modal.getInstance(document.getElementById('modal-new-instance'))?.hide();
+        await loadInstances();
+    } catch (err) {
+        showToast(err.message, 'error');
+    }
+}
+
+// ============== INSTANCE DETAIL ==============
+
+async function renderInstanceDetail(container) {
+    try {
+        const instance = await apiGet(`${MODULE_API}/instances/${currentInstanceId}`);
+        const clients = await apiGet(`${MODULE_API}/instances/${currentInstanceId}/clients`);
+
+        container.innerHTML = `
+            <div class="mb-3">
+                <a href="#openvpn" class="text-muted">
+                    <i class="ti ti-arrow-left me-1"></i>Torna alle istanze
+                </a>
+            </div>
+            
+            <!-- Instance Info Card -->
+            <div class="card mb-3">
                 <div class="card-header">
-                    <h3 class="card-title">
-                        <i class="ti ti-lock me-2"></i>
-                        ${escapeHtml(instance.name)}
-                    </h3>
-                    <div class="card-actions">
-                        <span class="badge ${isRunning ? 'bg-success' : 'bg-secondary'}">
-                            ${isRunning ? 'Running' : 'Stopped'}
-                        </span>
+                    <div class="d-flex justify-content-between align-items-center w-100">
+                        <div>
+                            <h3 class="card-title mb-0">${escapeHtml(instance.name)}</h3>
+                            <small class="text-muted">Interfaccia: ${instance.interface}</small>
+                        </div>
+                        <div class="btn-group">
+                            ${canManage ? `
+                            <button class="btn ${instance.status === 'running' ? 'btn-warning' : 'btn-success'}" 
+                                    onclick="${instance.status === 'running' ? 'stopInstance' : 'startInstance'}('${instance.id}')">
+                                <i class="ti ti-player-${instance.status === 'running' ? 'stop' : 'play'} me-1"></i>
+                                ${instance.status === 'running' ? 'Ferma' : 'Avvia'}
+                            </button>
+                            <button class="btn btn-outline-danger" onclick="deleteInstance('${instance.id}')">
+                                <i class="ti ti-trash"></i>
+                            </button>` : ''}
+                        </div>
                     </div>
                 </div>
                 <div class="card-body">
-                    <div class="datagrid">
-                        <div class="datagrid-item">
-                            <div class="datagrid-title">Porta</div>
-                            <div class="datagrid-content">${instance.port}/${instance.protocol.toUpperCase()}</div>
+                    <div class="row">
+                        <div class="col-md-2">
+                            <span class="text-muted">Stato</span><br>
+                            <span class="badge ${instance.status === 'running' ? 'bg-success' : 'bg-secondary'} fs-6">
+                                ${instance.status === 'running' ? 'Attivo' : 'Fermo'}
+                            </span>
                         </div>
-                        <div class="datagrid-item">
-                            <div class="datagrid-title">Subnet</div>
-                            <div class="datagrid-content">${instance.subnet}</div>
+                        <div class="col-md-2">
+                            <span class="text-muted">Porta</span><br>
+                            <strong>${instance.port}/${instance.protocol.toUpperCase()}</strong>
                         </div>
-                        <div class="datagrid-item">
-                            <div class="datagrid-title">Modalità</div>
-                            <div class="datagrid-content">
-                                <span class="badge bg-${instance.tunnel_mode === 'full' ? 'primary' : 'info'}">
-                                    ${instance.tunnel_mode === 'full' ? 'Full Tunnel' : 'Split Tunnel'}
-                                </span>
-                            </div>
+                        <div class="col-md-2">
+                            <span class="text-muted">Subnet</span><br>
+                            <code>${instance.subnet}</code>
                         </div>
-                        <div class="datagrid-item">
-                            <div class="datagrid-title">Client</div>
-                            <div class="datagrid-content">${instance.client_count}</div>
+                        <div class="col-md-2">
+                            <span class="text-muted">Modalità</span><br>
+                            <span id="display-tunnel-mode" class="badge ${instance.tunnel_mode === 'full' ? 'bg-blue' : 'bg-purple'}-lt">
+                                ${instance.tunnel_mode === 'full' ? 'Full Tunnel' : 'Split Tunnel'}
+                            </span>
+                            ${canManage ? `<button class="btn btn-sm btn-ghost-primary p-0 ms-1" id="btn-edit-routing" title="Modifica instradamento">
+                                <i class="ti ti-edit fs-5"></i>
+                            </button>` : ''}
+                        </div>
+                        <div class="col-md-2">
+                            <span class="text-muted">DNS</span><br>
+                            <small>${instance.dns_servers?.join(', ') || 'N/A'}</small>
+                        </div>
+                        <div class="col-md-2">
+                            <span class="text-muted">Client</span><br>
+                            <strong>${instance.client_count}</strong>
                         </div>
                     </div>
-                    ${certWarning ? `
-                        <div class="alert alert-warning mt-3 mb-0 py-2">
-                            <i class="ti ti-alert-triangle me-1"></i>
-                            Certificato in scadenza!
+                    <hr>
+                    <div class="row align-items-center">
+                        <div class="col-md-10">
+                            <span class="text-muted">Endpoint Pubblico:</span>
+                            <code id="display-endpoint">${instance.endpoint || '(auto-detect)'}</code>
+                        </div>
+                        <div class="col-md-2 text-end">
+                            <button class="btn btn-sm btn-outline-primary" id="btn-edit-endpoint">
+                                <i class="ti ti-edit me-1"></i>Modifica
+                            </button>
+                        </div>
+                    </div>
+                    <div id="display-routes-section">
+                    ${instance.tunnel_mode === 'split' && instance.routes?.length ? `
+                        <hr>
+                        <h4>Rotte Split Tunnel</h4>
+                        <div class="d-flex flex-wrap gap-2">
+                            ${instance.routes.map(r => `<code class="badge bg-light text-dark">${r.network || r}</code>`).join('')}
                         </div>
                     ` : ''}
-                </div>
-                <div class="card-footer d-flex gap-2">
-                    ${isRunning ? `
-                        <button class="btn btn-outline-danger btn-sm" 
-                                onclick="stopInstance('${instance.id}')">
-                            <i class="ti ti-player-stop me-1"></i>Stop
-                        </button>
-                    ` : `
-                        <button class="btn btn-outline-success btn-sm" 
-                                onclick="startInstance('${instance.id}')">
-                            <i class="ti ti-player-play me-1"></i>Start
-                        </button>
-                    `}
-                    <button class="btn btn-primary btn-sm ms-auto" 
-                            onclick="showInstanceDetail('${instance.id}')">
-                        <i class="ti ti-settings me-1"></i>Gestisci
-                    </button>
+                    </div>
                 </div>
             </div>
-        </div>
-    `;
-}
-
-/**
- * Show instance detail modal
- */
-async function showInstanceDetail(instanceId) {
-    currentInstance = instanceId;
-
-    try {
-        const [instance, clients, pkiStatus] = await Promise.all([
-            fetch(`${MODULE_BASE}/instances/${instanceId}`).then(r => r.json()),
-            fetch(`${MODULE_BASE}/instances/${instanceId}/clients`).then(r => r.json()),
-            fetch(`${MODULE_BASE}/instances/${instanceId}/pki/status`).then(r => r.json())
-        ]);
-
-        document.getElementById('modal-instance-title').textContent = instance.name;
-        document.getElementById('modal-instance-body').innerHTML = `
+            
+            <!-- Tabs for Clients, PKI and Firewall -->
             <ul class="nav nav-tabs" role="tablist">
-                <li class="nav-item">
-                    <a class="nav-link active" data-bs-toggle="tab" href="#tab-overview">
-                        <i class="ti ti-info-circle me-1"></i>Overview
-                    </a>
-                </li>
-                <li class="nav-item">
-                    <a class="nav-link" data-bs-toggle="tab" href="#tab-clients">
+                <li class="nav-item" role="presentation">
+                    <button class="nav-link active" id="tab-clients" data-bs-toggle="tab" data-bs-target="#pane-clients" type="button">
                         <i class="ti ti-users me-1"></i>Client (${clients.length})
-                    </a>
+                    </button>
                 </li>
-                <li class="nav-item">
-                    <a class="nav-link" data-bs-toggle="tab" href="#tab-pki">
+                <li class="nav-item" role="presentation">
+                    <button class="nav-link" id="tab-pki" data-bs-toggle="tab" data-bs-target="#pane-pki" type="button">
                         <i class="ti ti-certificate me-1"></i>PKI
-                    </a>
+                    </button>
                 </li>
-                <li class="nav-item">
-                    <a class="nav-link" data-bs-toggle="tab" href="#tab-firewall">
+                <li class="nav-item" role="presentation">
+                    <button class="nav-link" id="tab-firewall" data-bs-toggle="tab" data-bs-target="#pane-firewall" type="button">
                         <i class="ti ti-shield me-1"></i>Firewall
-                    </a>
+                    </button>
                 </li>
             </ul>
             
-            <div class="tab-content mt-3">
-                <!-- Overview Tab -->
-                <div class="tab-pane active" id="tab-overview">
-                    ${renderOverviewTab(instance)}
-                </div>
-                
+            <div class="tab-content">
                 <!-- Clients Tab -->
-                <div class="tab-pane" id="tab-clients">
-                    ${renderClientsTab(clients, instanceId)}
+                <div class="tab-pane fade show active" id="pane-clients" role="tabpanel">
+                    <div class="card card-body border-top-0 rounded-top-0">
+                        <div class="d-flex justify-content-between align-items-center mb-3">
+                            <h4 class="mb-0">Client VPN</h4>
+                            ${canClients ? `
+                            <button class="btn btn-primary" id="btn-new-client">
+                                <i class="ti ti-user-plus me-1"></i>Nuovo Client
+                            </button>` : ''}
+                        </div>
+                        ${clients.length === 0 ? `
+                            <div class="text-center py-4 text-muted">
+                                <i class="ti ti-users-minus" style="font-size: 2rem;"></i>
+                                <p class="mt-2">Nessun client configurato</p>
+                                <small>Clicca "Nuovo Client" per aggiungerne uno</small>
+                            </div>
+                        ` : `
+                            <div class="table-responsive">
+                                <table class="table table-vcenter">
+                                    <thead>
+                                        <tr>
+                                            <th>Stato</th>
+                                            <th>Nome</th>
+                                            <th>IP Assegnato</th>
+                                            <th>Certificato</th>
+                                            <th>Traffico</th>
+                                            <th>Ultima Connessione</th>
+                                            <th class="w-1">Azioni</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        ${clients.map(c => `
+                                            <tr class="${c.revoked ? 'text-muted' : ''}">
+                                                <td>
+                                                    ${c.is_connected === true
+                ? '<span class="status-dot status-dot-animated bg-success" title="Connesso"></span>'
+                : '<span class="status-dot bg-secondary" title="Offline"></span>'
+            }
+                                                </td>
+                                                <td>
+                                                    <strong>${escapeHtml(c.name)}</strong>
+                                                    ${c.revoked ? '<span class="badge bg-danger ms-1">Revocato</span>' : ''}
+                                                </td>
+                                                <td><code>${c.allocated_ip}</code></td>
+                                                <td>${renderCertStatus(c.cert_days_remaining, c.revoked)}</td>
+                                                <td>
+                                                    ${c.is_connected === true ? `
+                                                    <small class="text-muted">
+                                                        <i class="ti ti-arrow-down text-success"></i> ${formatBytes(c.bytes_received || 0)}
+                                                        <i class="ti ti-arrow-up text-primary ms-2"></i> ${formatBytes(c.bytes_sent || 0)}
+                                                    </small>
+                                                    ` : '<small class="text-muted">-</small>'}
+                                                </td>
+                                                <td>
+                                                    ${c.last_connection
+                ? `<small class="text-muted">${formatTimeAgo(c.last_connection)}</small>`
+                : '<small class="text-muted">Mai connesso</small>'
+            }
+                                                </td>
+                                                <td>
+                                                    <div class="btn-group">
+                                                        ${!c.revoked && canClients ? `
+                                                        <button class="btn btn-sm btn-outline-primary" onclick="downloadConfig('${c.name}')" title="Scarica Config">
+                                                            <i class="ti ti-download"></i>
+                                                        </button>
+                                                        <button class="btn btn-sm btn-outline-success" onclick="openSendEmailModal('${c.name}')" title="Invia via Email">
+                                                            <i class="ti ti-mail"></i>
+                                                        </button>
+                                                        <button class="btn btn-sm btn-outline-warning" onclick="renewClientCert('${c.name}')" title="Rinnova Certificato">
+                                                            <i class="ti ti-refresh"></i>
+                                                        </button>
+                                                        <button class="btn btn-sm btn-outline-danger" onclick="revokeClient('${c.name}')" title="Revoca">
+                                                            <i class="ti ti-ban"></i>
+                                                        </button>` : ''}
+                                                        ${c.revoked && canClients ? `
+                                                        <button class="btn btn-sm btn-outline-success" onclick="restoreClient('${c.name}')" title="Ripristina">
+                                                            <i class="ti ti-restore"></i>
+                                                        </button>
+                                                        <button class="btn btn-sm btn-outline-danger" onclick="deleteClientPermanent('${c.name}')" title="Elimina Definitivamente">
+                                                            <i class="ti ti-trash"></i>
+                                                        </button>` : ''}
+                                                    </div>
+                                                </td>
+                                            </tr>
+                                        `).join('')}
+                                    </tbody>
+                                </table>
+                            </div>
+                        `}
+                    </div>
                 </div>
                 
                 <!-- PKI Tab -->
-                <div class="tab-pane" id="tab-pki">
-                    ${renderPKITab(instance, pkiStatus)}
+                <div class="tab-pane fade" id="pane-pki" role="tabpanel">
+                    <div class="card card-body border-top-0 rounded-top-0" id="pki-content">
+                        <div class="text-center py-4 text-muted">
+                            <i class="ti ti-loader ti-spin" style="font-size: 2rem;"></i>
+                            <p class="mt-2">Caricamento...</p>
+                        </div>
+                    </div>
                 </div>
                 
                 <!-- Firewall Tab -->
-                <div class="tab-pane" id="tab-firewall">
-                    <div class="text-center py-4">
-                        <p class="text-muted">La gestione firewall sarà disponibile a breve</p>
-                    </div>
-                </div>
-            </div>
-        `;
-
-        new bootstrap.Modal(document.getElementById('modal-instance-detail')).show();
-    } catch (error) {
-        console.error('Error loading instance detail:', error);
-        showToast('Errore nel caricamento dei dettagli', 'danger');
-    }
-}
-
-/**
- * Render overview tab
- */
-function renderOverviewTab(instance) {
-    return `
-        <div class="row">
-            <div class="col-md-6">
-                <div class="datagrid">
-                    <div class="datagrid-item">
-                        <div class="datagrid-title">ID</div>
-                        <div class="datagrid-content"><code>${instance.id}</code></div>
-                    </div>
-                    <div class="datagrid-item">
-                        <div class="datagrid-title">Porta</div>
-                        <div class="datagrid-content">${instance.port}/${instance.protocol.toUpperCase()}</div>
-                    </div>
-                    <div class="datagrid-item">
-                        <div class="datagrid-title">Subnet</div>
-                        <div class="datagrid-content">${instance.subnet}</div>
-                    </div>
-                    <div class="datagrid-item">
-                        <div class="datagrid-title">Interfaccia</div>
-                        <div class="datagrid-content"><code>${instance.interface}</code></div>
-                    </div>
-                </div>
-            </div>
-            <div class="col-md-6">
-                <div class="datagrid">
-                    <div class="datagrid-item">
-                        <div class="datagrid-title">Modalità Tunnel</div>
-                        <div class="datagrid-content">
-                            <span class="badge bg-${instance.tunnel_mode === 'full' ? 'primary' : 'info'}">
-                                ${instance.tunnel_mode === 'full' ? 'Full Tunnel' : 'Split Tunnel'}
-                            </span>
+                <div class="tab-pane fade" id="pane-firewall" role="tabpanel">
+                    <div class="card card-body border-top-0 rounded-top-0" id="firewall-content">
+                        <div class="text-center py-4 text-muted">
+                            <i class="ti ti-loader ti-spin" style="font-size: 2rem;"></i>
+                            <p class="mt-2">Caricamento...</p>
                         </div>
-                    </div>
-                    <div class="datagrid-item">
-                        <div class="datagrid-title">Cipher</div>
-                        <div class="datagrid-content">${instance.cipher}</div>
-                    </div>
-                    <div class="datagrid-item">
-                        <div class="datagrid-title">DNS</div>
-                        <div class="datagrid-content">${instance.dns_servers.join(', ')}</div>
-                    </div>
-                    <div class="datagrid-item">
-                        <div class="datagrid-title">Endpoint</div>
-                        <div class="datagrid-content">${instance.endpoint || 'Auto-detect'}</div>
                     </div>
                 </div>
             </div>
         </div>
         
-        <div class="mt-4">
-            <button class="btn btn-outline-primary" onclick="editRouting('${instance.id}')">
-                <i class="ti ti-route me-1"></i>Modifica Routing
-            </button>
-            <button class="btn btn-outline-danger ms-2" onclick="deleteInstance('${instance.id}')">
-                <i class="ti ti-trash me-1"></i>Elimina Istanza
-            </button>
-        </div>
-    `;
-}
-
-/**
- * Render clients tab
- */
-function renderClientsTab(clients, instanceId) {
-    return `
-        <div class="mb-3">
-            <button class="btn btn-primary" onclick="showCreateClientModal('${instanceId}')">
-                <i class="ti ti-user-plus me-1"></i>Nuovo Client
-            </button>
+        <!-- New Client Modal -->
+        <div class="modal" id="modal-new-client" tabindex="-1">
+            <div class="modal-dialog modal-sm">
+                <div class="modal-content">
+                    <div class="modal-header">
+                        <h5 class="modal-title">Nuovo Client</h5>
+                        <button class="btn-close" data-bs-dismiss="modal"></button>
+                    </div>
+                    <div class="modal-body">
+                        <div class="mb-3">
+                            <label class="form-label" for="new-client-name">Nome del client</label>
+                            <input type="text" class="form-control" id="new-client-name" placeholder="es. iPhone.Mario">
+                            <small class="form-hint">Lettere, numeri, . - e _</small>
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label">Durata Certificato (giorni)</label>
+                            <input type="number" class="form-control" id="new-client-cert-days" placeholder="Lascia vuoto per default istanza">
+                        </div>
+                    </div>
+                    <div class="modal-footer">
+                        <button class="btn btn-secondary" data-bs-dismiss="modal">Annulla</button>
+                        <button class="btn btn-primary" id="btn-confirm-new-client">Crea</button>
+                    </div>
+                </div>
+            </div>
         </div>
         
-        ${clients.length === 0 ? `
-            <div class="text-center py-4">
-                <p class="text-muted">Nessun client configurato</p>
-            </div>
-        ` : `
-            <div class="table-responsive">
-                <table class="table table-vcenter card-table">
-                    <thead>
-                        <tr>
-                            <th>Nome</th>
-                            <th>IP</th>
-                            <th>Stato</th>
-                            <th>Certificato</th>
-                            <th>Azioni</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        ${clients.map(client => `
-                            <tr class="${client.revoked ? 'text-muted' : ''}">
-                                <td>
-                                    <strong>${escapeHtml(client.name)}</strong>
-                                    ${client.revoked ? '<span class="badge bg-danger ms-1">Revocato</span>' : ''}
-                                </td>
-                                <td><code>${client.allocated_ip}</code></td>
-                                <td>
-                                    ${client.is_connected ?
-            '<span class="badge bg-success">Connesso</span>' :
-            '<span class="badge bg-secondary">Offline</span>'}
-                                </td>
-                                <td>
-                                    ${renderCertStatus(client.cert_days_remaining, client.revoked)}
-                                </td>
-                                <td>
-                                    ${!client.revoked ? `
-                                        <div class="btn-group btn-group-sm">
-                                            <a href="${MODULE_BASE}/instances/${instanceId}/clients/${client.name}/config" 
-                                               class="btn btn-outline-primary" title="Download Config">
-                                                <i class="ti ti-download"></i>
-                                            </a>
-                                            <button class="btn btn-outline-secondary" 
-                                                    onclick="showClientQR('${instanceId}', '${client.name}')"
-                                                    title="QR Code">
-                                                <i class="ti ti-qrcode"></i>
-                                            </button>
-                                            <button class="btn btn-outline-warning" 
-                                                    onclick="renewClientCert('${instanceId}', '${client.name}')"
-                                                    title="Rinnova Certificato">
-                                                <i class="ti ti-refresh"></i>
-                                            </button>
-                                            <button class="btn btn-outline-danger" 
-                                                    onclick="revokeClient('${instanceId}', '${client.name}')"
-                                                    title="Revoca">
-                                                <i class="ti ti-trash"></i>
-                                            </button>
-                                        </div>
-                                    ` : ''}
-                                </td>
-                            </tr>
-                        `).join('')}
-                    </tbody>
-                </table>
-            </div>
-        `}
-    `;
-}
-
-/**
- * Render PKI tab
- */
-function renderPKITab(instance, pkiStatus) {
-    return `
-        <div class="row">
-            <div class="col-md-6">
-                <div class="card">
-                    <div class="card-header">
-                        <h4 class="card-title">Certificato Server</h4>
+        <!-- Edit Endpoint Modal -->
+        <div class="modal" id="modal-edit-endpoint" tabindex="-1">
+            <div class="modal-dialog modal-sm">
+                <div class="modal-content">
+                    <div class="modal-header">
+                        <h5 class="modal-title">Modifica Endpoint</h5>
+                        <button class="btn-close" data-bs-dismiss="modal"></button>
                     </div>
-                    <div class="card-body">
-                        <div class="datagrid">
-                            <div class="datagrid-item">
-                                <div class="datagrid-title">Scadenza</div>
-                                <div class="datagrid-content">
-                                    ${instance.server_cert_expiry ?
-            formatDate(instance.server_cert_expiry) : 'N/A'}
-                                </div>
-                            </div>
-                            <div class="datagrid-item">
-                                <div class="datagrid-title">Giorni Rimanenti</div>
-                                <div class="datagrid-content">
-                                    ${renderCertStatus(pkiStatus.server_cert_days_remaining, false)}
-                                </div>
-                            </div>
+                    <div class="modal-body">
+                        <div class="mb-3">
+                            <label class="form-label" for="edit-endpoint-value">Endpoint Pubblico (IP o dominio)</label>
+                            <input type="text" class="form-control" id="edit-endpoint-value" placeholder="es. vpn.example.com o 1.2.3.4">
+                            <small class="form-hint">Lascia vuoto per usare auto-detect dell'IP pubblico</small>
                         </div>
-                        <button class="btn btn-warning mt-3" 
-                                onclick="renewServerCert('${instance.id}')">
-                            <i class="ti ti-refresh me-1"></i>Rinnova Certificato Server
+                    </div>
+                    <div class="modal-footer">
+                        <button class="btn btn-secondary" data-bs-dismiss="modal">Annulla</button>
+                        <button class="btn btn-primary" id="btn-save-endpoint">Salva</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Send Email Modal -->
+        <div class="modal" id="modal-send-email" tabindex="-1">
+            <div class="modal-dialog modal-sm">
+                <div class="modal-content">
+                    <div class="modal-header">
+                        <h5 class="modal-title">Invia Config via Email</h5>
+                        <button class="btn-close" data-bs-dismiss="modal"></button>
+                    </div>
+                    <div class="modal-body">
+                        <input type="hidden" id="send-email-client-name">
+                        <div class="mb-3">
+                            <label class="form-label" for="send-email-address">Email destinatario</label>
+                            <input type="email" class="form-control" id="send-email-address" placeholder="utente@example.com">
+                            <small class="form-hint">Il destinatario riceverà un link valido 48 ore</small>
+                        </div>
+                    </div>
+                    <div class="modal-footer">
+                        <button class="btn btn-secondary" data-bs-dismiss="modal">Annulla</button>
+                        <button class="btn btn-success" id="btn-send-email">
+                            <i class="ti ti-mail me-1"></i>Invia
                         </button>
                     </div>
                 </div>
             </div>
-            <div class="col-md-6">
-                <div class="card">
-                    <div class="card-header">
-                        <h4 class="card-title">Certificate Authority</h4>
+        </div>
+        
+        <!-- Edit Routing Modal -->
+        <div class="modal" id="modal-edit-routing" tabindex="-1">
+            <div class="modal-dialog">
+                <div class="modal-content">
+                    <div class="modal-header">
+                        <h5 class="modal-title">Modifica Instradamento</h5>
+                        <button class="btn-close" data-bs-dismiss="modal"></button>
                     </div>
-                    <div class="card-body">
-                        <div class="datagrid">
-                            <div class="datagrid-item">
-                                <div class="datagrid-title">Scadenza CA</div>
-                                <div class="datagrid-content">
-                                    ${pkiStatus.ca_expiry ? formatDate(pkiStatus.ca_expiry) : 'N/A'}
+                    <div class="modal-body">
+                        <div class="alert alert-info">
+                            <i class="ti ti-info-circle me-2"></i>
+                            Le nuove rotte saranno applicate automaticamente alla prossima connessione dei client.
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label">Modalità Tunnel</label>
+                            <div class="row g-2">
+                                <div class="col-6">
+                                    <input type="radio" class="btn-check" name="routing-mode" id="routing-full" value="full" ${instance.tunnel_mode === 'full' ? 'checked' : ''}>
+                                    <label class="btn btn-outline-primary w-100 text-start py-2 d-block" for="routing-full">
+                                        <i class="ti ti-world me-2"></i><strong>Full Tunnel</strong><br>
+                                        <small class="opacity-75">Tutto il traffico passa dalla VPN</small>
+                                    </label>
+                                </div>
+                                <div class="col-6">
+                                    <input type="radio" class="btn-check" name="routing-mode" id="routing-split" value="split" ${instance.tunnel_mode === 'split' ? 'checked' : ''}>
+                                    <label class="btn btn-outline-primary w-100 text-start py-2 d-block" for="routing-split">
+                                        <i class="ti ti-route me-2"></i><strong>Split Tunnel</strong><br>
+                                        <small class="opacity-75">Solo reti specifiche via VPN</small>
+                                    </label>
                                 </div>
                             </div>
-                            <div class="datagrid-item">
-                                <div class="datagrid-title">Client Revocati</div>
-                                <div class="datagrid-content">${pkiStatus.revoked_clients_count}</div>
-                            </div>
                         </div>
+                        <div class="mb-3" id="routing-dns-section">
+                            <label class="form-label">Server DNS</label>
+                            <input type="text" class="form-control" id="routing-dns" value="${(instance.dns_servers || []).join(', ')}" placeholder="es. 1.1.1.1, 8.8.8.8">
+                            <small class="form-hint">Separati da virgola. Lascia vuoto per non pushare DNS ai client.</small>
+                        </div>
+                        <div id="routing-routes-section" class="${instance.tunnel_mode === 'full' ? 'd-none' : ''}">
+                            <label class="form-label">Reti da instradare</label>
+                            <div id="routing-routes-list">
+                                ${(instance.routes || []).map((r, i) => `
+                                    <div class="routing-route-row mb-2 d-flex gap-2 align-items-center">
+                                        <input type="text" class="form-control routing-route-input" value="${r.network || r}" placeholder="es. 192.168.1.0/24" style="flex: 2">
+                                        <input type="text" class="form-control routing-iface-input" value="${r.interface || ''}" placeholder="eth0" style="flex: 1" title="Interfaccia uscita (opzionale)">
+                                        <button class="btn btn-outline-danger routing-remove-route" type="button"><i class="ti ti-trash"></i></button>
+                                    </div>
+                                `).join('')}
+                            </div>
+                            <button class="btn btn-sm btn-outline-primary" id="btn-add-routing-route" type="button">
+                                <i class="ti ti-plus me-1"></i>Aggiungi rete
+                            </button>
+                            <small class="form-hint d-block mt-2">Subnet da instradare via VPN. Interfaccia opzionale per NAT (default: WAN).</small>
+                        </div>
+                    </div>
+                    <div class="modal-footer">
+                        <button class="btn btn-secondary" data-bs-dismiss="modal">Annulla</button>
+                        <button class="btn btn-primary" id="btn-save-routing">
+                            <i class="ti ti-device-floppy me-1"></i>Salva e Applica
+                        </button>
                     </div>
                 </div>
             </div>
         </div>
-    `;
+        `;
+
+        // New client button - open modal
+        document.getElementById('btn-new-client')?.addEventListener('click', () => {
+            document.getElementById('new-client-name').value = '';
+            document.getElementById('new-client-cert-days').value = '';
+            new bootstrap.Modal(document.getElementById('modal-new-client')).show();
+        });
+
+        // Confirm new client
+        document.getElementById('btn-confirm-new-client')?.addEventListener('click', async () => {
+            const name = document.getElementById('new-client-name').value.trim();
+            const certDays = document.getElementById('new-client-cert-days').value;
+            if (!name) {
+                showToast('Inserisci un nome per il client', 'error');
+                return;
+            }
+            try {
+                await apiPost(`${MODULE_API}/instances/${currentInstanceId}/clients`, {
+                    name,
+                    cert_duration_days: certDays ? parseInt(certDays) : null
+                });
+                showToast('Client creato con successo', 'success');
+                bootstrap.Modal.getInstance(document.getElementById('modal-new-client'))?.hide();
+                renderInstanceDetail(container);
+            } catch (err) {
+                showToast(err.message, 'error');
+            }
+        });
+
+        // Edit endpoint button
+        document.getElementById('btn-edit-endpoint')?.addEventListener('click', () => {
+            document.getElementById('edit-endpoint-value').value = instance.endpoint || '';
+            new bootstrap.Modal(document.getElementById('modal-edit-endpoint')).show();
+        });
+
+        // Save endpoint
+        document.getElementById('btn-save-endpoint')?.addEventListener('click', async () => {
+            const endpoint = document.getElementById('edit-endpoint-value').value.trim() || null;
+            try {
+                await apiPatch(`${MODULE_API}/instances/${currentInstanceId}`, { endpoint });
+                showToast('Endpoint aggiornato', 'success');
+                bootstrap.Modal.getInstance(document.getElementById('modal-edit-endpoint'))?.hide();
+                document.getElementById('display-endpoint').textContent = endpoint || '(auto-detect)';
+                instance.endpoint = endpoint;
+            } catch (err) {
+                showToast(err.message, 'error');
+            }
+        });
+
+        // Edit routing button
+        document.getElementById('btn-edit-routing')?.addEventListener('click', async () => {
+            new bootstrap.Modal(document.getElementById('modal-edit-routing')).show();
+        });
+
+        // Toggle routes section visibility based on mode selection
+        document.querySelectorAll('input[name="routing-mode"]').forEach(radio => {
+            radio.addEventListener('change', () => {
+                const routesSection = document.getElementById('routing-routes-section');
+                if (document.getElementById('routing-split').checked) {
+                    routesSection.classList.remove('d-none');
+                } else {
+                    routesSection.classList.add('d-none');
+                }
+            });
+        });
+
+        // Add route button
+        document.getElementById('btn-add-routing-route')?.addEventListener('click', () => {
+            const list = document.getElementById('routing-routes-list');
+            const row = document.createElement('div');
+            row.className = 'routing-route-row mb-2 d-flex gap-2 align-items-center';
+            row.innerHTML = `
+                <input type="text" class="form-control routing-route-input" placeholder="es. 192.168.1.0/24" style="flex: 2">
+                <input type="text" class="form-control routing-iface-input" placeholder="eth0" style="flex: 1" title="Interfaccia uscita (opzionale)">
+                <button class="btn btn-outline-danger routing-remove-route" type="button"><i class="ti ti-trash"></i></button>
+            `;
+            list.appendChild(row);
+        });
+
+        // Remove route buttons (event delegation)
+        document.getElementById('routing-routes-list')?.addEventListener('click', (e) => {
+            if (e.target.closest('.routing-remove-route')) {
+                e.target.closest('.routing-route-row')?.remove();
+            }
+        });
+
+        // Save routing
+        document.getElementById('btn-save-routing')?.addEventListener('click', async () => {
+            const btn = document.getElementById('btn-save-routing');
+            const originalHtml = btn.innerHTML;
+            btn.disabled = true;
+            btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>Salvataggio...';
+
+            try {
+                const tunnelMode = document.querySelector('input[name="routing-mode"]:checked').value;
+                let routes = [];
+
+                // Parse DNS servers
+                const dnsInput = document.getElementById('routing-dns').value.trim();
+                const dnsServers = dnsInput ? dnsInput.split(',').map(s => s.trim()).filter(s => s) : [];
+
+                if (tunnelMode === 'split') {
+                    document.querySelectorAll('.routing-route-row').forEach(row => {
+                        const networkInput = row.querySelector('.routing-route-input');
+                        const ifaceInput = row.querySelector('.routing-iface-input');
+                        const network = networkInput?.value.trim();
+                        const iface = ifaceInput?.value.trim();
+                        if (network) {
+                            routes.push({ network: network, interface: iface || null });
+                        }
+                    });
+                    if (routes.length === 0) {
+                        showToast('Split tunnel richiede almeno una rete', 'error');
+                        btn.disabled = false;
+                        btn.innerHTML = originalHtml;
+                        return;
+                    }
+                }
+
+                const result = await apiPatch(`${MODULE_API}/instances/${currentInstanceId}/routing`, {
+                    tunnel_mode: tunnelMode,
+                    routes: routes,
+                    dns_servers: dnsServers
+                });
+
+                bootstrap.Modal.getInstance(document.getElementById('modal-edit-routing'))?.hide();
+                showToast(result.message, 'success');
+
+                if (result.warning) {
+                    setTimeout(() => showToast(result.warning, 'warning'), 1500);
+                }
+
+                // Reload to show updated data
+                renderInstanceDetail(container);
+            } catch (err) {
+                showToast(err.message, 'error');
+            } finally {
+                btn.disabled = false;
+                btn.innerHTML = originalHtml;
+            }
+        });
+
+        // Load PKI tab when clicked
+        document.getElementById('tab-pki')?.addEventListener('shown.bs.tab', async () => {
+            await loadPKIStatus();
+        });
+
+        // Load firewall tab when clicked
+        document.getElementById('tab-firewall')?.addEventListener('shown.bs.tab', async () => {
+            try {
+                const firewallModule = await import('./firewall.js');
+                await firewallModule.init(document.getElementById('firewall-content'), currentInstanceId);
+            } catch (err) {
+                document.getElementById('firewall-content').innerHTML = `
+                    <div class="alert alert-danger">${err.message}</div>
+                `;
+            }
+        });
+    } catch (err) {
+        container.innerHTML = `<div class="alert alert-danger">
+            <i class="ti ti-alert-circle me-2"></i>${err.message}
+        </div>`;
+    }
 }
 
-/**
- * Render certificate status badge
- */
+// Render certificate status badge
 function renderCertStatus(daysRemaining, revoked) {
     if (revoked) {
         return '<span class="badge bg-danger">Revocato</span>';
@@ -634,273 +893,261 @@ function renderCertStatus(daysRemaining, revoked) {
     return `<span class="badge bg-success">${daysRemaining} giorni</span>`;
 }
 
-// =============================================================================
-// EVENT LISTENERS
-// =============================================================================
+// Load PKI status
+async function loadPKIStatus() {
+    const container = document.getElementById('pki-content');
+    try {
+        const [instance, pkiStatus] = await Promise.all([
+            apiGet(`${MODULE_API}/instances/${currentInstanceId}`),
+            apiGet(`${MODULE_API}/instances/${currentInstanceId}/pki/status`)
+        ]);
 
-function setupEventListeners() {
-    // Create instance button
-    document.getElementById('btn-create-instance').addEventListener('click', () => {
-        document.getElementById('form-create-instance').reset();
-        document.getElementById('split-tunnel-options').classList.add('d-none');
-        document.getElementById('full-tunnel-options').classList.remove('d-none');
-        new bootstrap.Modal(document.getElementById('modal-create-instance')).show();
-    });
-
-    // Tunnel mode toggle
-    document.querySelectorAll('input[name="tunnel_mode"]').forEach(radio => {
-        radio.addEventListener('change', (e) => {
-            const isSplit = e.target.value === 'split';
-            document.getElementById('split-tunnel-options').classList.toggle('d-none', !isSplit);
-            document.getElementById('full-tunnel-options').classList.toggle('d-none', isSplit);
-        });
-    });
-
-    // Add route button
-    document.getElementById('btn-add-route')?.addEventListener('click', () => {
-        const list = document.getElementById('routes-list');
-        const row = document.createElement('div');
-        row.className = 'route-row mb-2 d-flex gap-2';
-        row.innerHTML = `
-            <input type="text" class="form-control route-input" placeholder="es. 192.168.1.0/24">
-            <button type="button" class="btn btn-outline-danger btn-remove-route">
-                <i class="ti ti-trash"></i>
-            </button>
+        container.innerHTML = `
+            <div class="row">
+                <div class="col-md-6">
+                    <div class="card">
+                        <div class="card-header">
+                            <h4 class="card-title">Certificato Server</h4>
+                        </div>
+                        <div class="card-body">
+                            <div class="datagrid">
+                                <div class="datagrid-item">
+                                    <div class="datagrid-title">Scadenza</div>
+                                    <div class="datagrid-content">
+                                        ${instance.server_cert_expiry ? new Date(instance.server_cert_expiry).toLocaleDateString('it-IT') : 'N/A'}
+                                    </div>
+                                </div>
+                                <div class="datagrid-item">
+                                    <div class="datagrid-title">Giorni Rimanenti</div>
+                                    <div class="datagrid-content">
+                                        ${renderCertStatus(pkiStatus.server_cert_days_remaining, false)}
+                                    </div>
+                                </div>
+                            </div>
+                            ${canManage ? `
+                            <button class="btn btn-warning mt-3" onclick="renewServerCert()">
+                                <i class="ti ti-refresh me-1"></i>Rinnova Certificato Server
+                            </button>` : ''}
+                        </div>
+                    </div>
+                </div>
+                <div class="col-md-6">
+                    <div class="card">
+                        <div class="card-header">
+                            <h4 class="card-title">Certificate Authority</h4>
+                        </div>
+                        <div class="card-body">
+                            <div class="datagrid">
+                                <div class="datagrid-item">
+                                    <div class="datagrid-title">Scadenza CA</div>
+                                    <div class="datagrid-content">
+                                        ${pkiStatus.ca_expiry ? new Date(pkiStatus.ca_expiry).toLocaleDateString('it-IT') : 'N/A'}
+                                    </div>
+                                </div>
+                                <div class="datagrid-item">
+                                    <div class="datagrid-title">Client Revocati</div>
+                                    <div class="datagrid-content">${pkiStatus.revoked_clients_count}</div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
         `;
-        list.appendChild(row);
-    });
-
-    // Remove route buttons (delegated)
-    document.getElementById('routes-list')?.addEventListener('click', (e) => {
-        if (e.target.closest('.btn-remove-route')) {
-            const rows = document.querySelectorAll('.route-row');
-            if (rows.length > 1) {
-                e.target.closest('.route-row').remove();
-            }
-        }
-    });
-
-    // Save instance
-    document.getElementById('btn-save-instance').addEventListener('click', createInstance);
-
-    // Save client
-    document.getElementById('btn-save-client').addEventListener('click', createClient);
-}
-
-// =============================================================================
-// API FUNCTIONS
-// =============================================================================
-
-async function createInstance() {
-    const form = document.getElementById('form-create-instance');
-    const formData = new FormData(form);
-
-    const data = {
-        name: formData.get('name'),
-        port: parseInt(formData.get('port')),
-        protocol: formData.get('protocol'),
-        subnet: formData.get('subnet'),
-        tunnel_mode: formData.get('tunnel_mode'),
-        cipher: formData.get('cipher'),
-        cert_duration_days: parseInt(formData.get('cert_duration_days')) || 3650,
-        endpoint: formData.get('endpoint') || null,
-        dns_servers: formData.get('dns_servers')?.split(',').map(s => s.trim()).filter(Boolean) || [],
-        routes: []
-    };
-
-    if (data.tunnel_mode === 'split') {
-        document.querySelectorAll('.route-input').forEach(input => {
-            if (input.value.trim()) {
-                data.routes.push({ network: input.value.trim() });
-            }
-        });
-    }
-
-    try {
-        const response = await fetch(`${MODULE_BASE}/instances`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(data)
-        });
-
-        if (!response.ok) {
-            const error = await response.json();
-            throw new Error(error.detail || 'Errore nella creazione');
-        }
-
-        bootstrap.Modal.getInstance(document.getElementById('modal-create-instance')).hide();
-        showToast('Istanza creata con successo', 'success');
-        await loadInstances();
-    } catch (error) {
-        showToast(error.message, 'danger');
+    } catch (err) {
+        container.innerHTML = `<div class="alert alert-danger">${err.message}</div>`;
     }
 }
 
-async function startInstance(instanceId) {
+// ============== GLOBAL FUNCTIONS ==============
+
+window.startInstance = async (id) => {
     try {
-        const response = await fetch(`${MODULE_BASE}/instances/${instanceId}/start`, {
-            method: 'POST'
-        });
-        if (!response.ok) throw new Error('Errore avvio istanza');
+        await apiPost(`${MODULE_API}/instances/${id}/start`);
         showToast('Istanza avviata', 'success');
-        await loadInstances();
-    } catch (error) {
-        showToast(error.message, 'danger');
+        location.reload();
+    } catch (err) {
+        showToast(err.message, 'error');
     }
-}
+};
 
-async function stopInstance(instanceId) {
+window.stopInstance = async (id) => {
     try {
-        const response = await fetch(`${MODULE_BASE}/instances/${instanceId}/stop`, {
-            method: 'POST'
-        });
-        if (!response.ok) throw new Error('Errore arresto istanza');
+        await apiPost(`${MODULE_API}/instances/${id}/stop`);
         showToast('Istanza fermata', 'success');
-        await loadInstances();
-    } catch (error) {
-        showToast(error.message, 'danger');
+        location.reload();
+    } catch (err) {
+        showToast(err.message, 'error');
     }
-}
+};
 
-async function deleteInstance(instanceId) {
-    if (!confirm('Sei sicuro di voler eliminare questa istanza?')) return;
-
-    try {
-        const response = await fetch(`${MODULE_BASE}/instances/${instanceId}`, {
-            method: 'DELETE'
-        });
-        if (!response.ok) throw new Error('Errore eliminazione istanza');
-
-        bootstrap.Modal.getInstance(document.getElementById('modal-instance-detail')).hide();
-        showToast('Istanza eliminata', 'success');
-        await loadInstances();
-    } catch (error) {
-        showToast(error.message, 'danger');
+window.deleteInstance = async (id) => {
+    if (await confirmDialog('Eliminare questa istanza e tutti i suoi client?', 'Elimina')) {
+        try {
+            await apiDelete(`${MODULE_API}/instances/${id}`);
+            showToast('Istanza eliminata', 'success');
+            location.href = '#openvpn';
+        } catch (err) {
+            showToast(err.message, 'error');
+        }
     }
-}
+};
 
-function showCreateClientModal(instanceId) {
-    currentInstance = instanceId;
-    document.getElementById('form-create-client').reset();
-    new bootstrap.Modal(document.getElementById('modal-create-client')).show();
-}
-
-async function createClient() {
-    const form = document.getElementById('form-create-client');
-    const formData = new FormData(form);
-
-    const data = {
-        name: formData.get('name'),
-        cert_duration_days: formData.get('cert_duration_days') ?
-            parseInt(formData.get('cert_duration_days')) : null
-    };
-
+window.downloadConfig = async (name) => {
     try {
-        const response = await fetch(`${MODULE_BASE}/instances/${currentInstance}/clients`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(data)
+        const token = localStorage.getItem('madmin_token');
+        const res = await fetch(`/api${MODULE_API}/instances/${currentInstanceId}/clients/${name}/config`, {
+            headers: { 'Authorization': `Bearer ${token}` }
         });
 
-        if (!response.ok) {
-            const error = await response.json();
-            throw new Error(error.detail || 'Errore nella creazione');
+        if (!res.ok) throw new Error('Download fallito: ' + res.statusText);
+
+        const blob = await res.blob();
+        const url = window.URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `${name}.ovpn`;
+        document.body.appendChild(a);
+        a.click();
+        window.URL.revokeObjectURL(url);
+        document.body.removeChild(a);
+    } catch (err) {
+        showToast(err.message, 'error');
+    }
+};
+
+window.showQR = async (name) => {
+    try {
+        const token = localStorage.getItem('madmin_token');
+        const res = await fetch(`/api${MODULE_API}/instances/${currentInstanceId}/clients/${name}/qr`, {
+            headers: { 'Authorization': `Bearer ${token}` }
+        });
+
+        if (!res.ok) throw new Error('Caricamento QR fallito: ' + res.statusText);
+
+        const blob = await res.blob();
+        const url = window.URL.createObjectURL(blob);
+
+        const modal = document.createElement('div');
+        modal.innerHTML = `
+            <div class="modal fade" tabindex="-1">
+                <div class="modal-dialog modal-sm">
+                    <div class="modal-content">
+                        <div class="modal-header">
+                            <h5 class="modal-title">QR Code - ${escapeHtml(name)}</h5>
+                            <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                        </div>
+                        <div class="modal-body text-center p-4">
+                            <img src="${url}" class="img-fluid" alt="QR Code">
+                            <p class="mt-3 mb-0 text-muted small">Il QR contiene un link per scaricare la configurazione (valido 48 ore)</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        `;
+        document.body.appendChild(modal);
+        const bsModal = new bootstrap.Modal(modal.querySelector('.modal'));
+        bsModal.show();
+        modal.querySelector('.modal').addEventListener('hidden.bs.modal', () => {
+            modal.remove();
+            window.URL.revokeObjectURL(url);
+        });
+    } catch (err) {
+        showToast(err.message, 'error');
+    }
+};
+
+window.revokeClient = async (name) => {
+    if (await confirmDialog('Revoca Client', `Revocare il client "${name}"? Il client perderà l'accesso alla VPN.`, 'Revoca')) {
+        try {
+            await apiDelete(`${MODULE_API}/instances/${currentInstanceId}/clients/${name}`);
+            showToast('Client revocato', 'success');
+            location.reload();
+        } catch (err) {
+            showToast(err.message, 'error');
+        }
+    }
+};
+
+window.renewClientCert = async (name) => {
+    if (await confirmDialog('Rinnova Certificato', `Rinnovare il certificato per "${name}"? Il client dovrà riscaricare la configurazione.`, 'Rinnova')) {
+        try {
+            await apiPost(`${MODULE_API}/instances/${currentInstanceId}/clients/${name}/renew`);
+            showToast('Certificato rinnovato', 'success');
+            location.reload();
+        } catch (err) {
+            showToast(err.message, 'error');
+        }
+    }
+};
+
+window.restoreClient = async (name) => {
+    if (await confirmDialog('Ripristina Client', `Ripristinare il client "${name}"? Verrà generato un nuovo certificato e il client dovrà scaricare la nuova configurazione.`, 'Ripristina', 'btn-success')) {
+        try {
+            await apiPost(`${MODULE_API}/instances/${currentInstanceId}/clients/${name}/restore`);
+            showToast('Client ripristinato con nuovo certificato', 'success');
+            location.reload();
+        } catch (err) {
+            showToast(err.message, 'error');
+        }
+    }
+};
+
+window.deleteClientPermanent = async (name) => {
+    if (await confirmDialog('Elimina Client', `Eliminare definitivamente il client "${name}"? Questa azione è irreversibile.`, 'Elimina')) {
+        try {
+            await apiDelete(`${MODULE_API}/instances/${currentInstanceId}/clients/${name}/permanent`);
+            showToast('Client eliminato definitivamente', 'success');
+            location.reload();
+        } catch (err) {
+            showToast(err.message, 'error');
+        }
+    }
+};
+
+window.renewServerCert = async () => {
+    if (await confirmDialog('Rinnova Certificato Server', 'Rinnovare il certificato server? L\'istanza verrà riavviata.', 'Rinnova')) {
+        try {
+            await apiPost(`${MODULE_API}/instances/${currentInstanceId}/pki/renew-server`);
+            showToast('Certificato server rinnovato', 'success');
+            location.reload();
+        } catch (err) {
+            showToast(err.message, 'error');
+        }
+    }
+};
+
+window.openSendEmailModal = (clientName) => {
+    document.getElementById('send-email-client-name').value = clientName;
+    document.getElementById('send-email-address').value = '';
+    new bootstrap.Modal(document.getElementById('modal-send-email')).show();
+};
+
+// Setup send email button handler
+document.addEventListener('click', async (e) => {
+    if (e.target.id === 'btn-send-email' || e.target.closest('#btn-send-email')) {
+        const clientName = document.getElementById('send-email-client-name').value;
+        const email = document.getElementById('send-email-address').value.trim();
+
+        if (!email) {
+            showToast('Inserisci un indirizzo email', 'error');
+            return;
         }
 
-        bootstrap.Modal.getInstance(document.getElementById('modal-create-client')).hide();
-        showToast('Client creato con successo', 'success');
-        showInstanceDetail(currentInstance);
-    } catch (error) {
-        showToast(error.message, 'danger');
+        const btn = document.getElementById('btn-send-email');
+        const originalHtml = btn.innerHTML;
+        btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>Invio...';
+        btn.disabled = true;
+
+        try {
+            await apiPost(`${MODULE_API}/instances/${currentInstanceId}/clients/${clientName}/send-config`, { email });
+            showToast(`Email inviata a ${email}`, 'success');
+            bootstrap.Modal.getInstance(document.getElementById('modal-send-email'))?.hide();
+        } catch (err) {
+            showToast(err.message, 'error');
+        } finally {
+            btn.innerHTML = originalHtml;
+            btn.disabled = false;
+        }
     }
-}
-
-async function revokeClient(instanceId, clientName) {
-    if (!confirm(`Sei sicuro di voler revocare il client "${clientName}"?`)) return;
-
-    try {
-        const response = await fetch(
-            `${MODULE_BASE}/instances/${instanceId}/clients/${clientName}`,
-            { method: 'DELETE' }
-        );
-        if (!response.ok) throw new Error('Errore revoca client');
-        showToast('Client revocato', 'success');
-        showInstanceDetail(instanceId);
-    } catch (error) {
-        showToast(error.message, 'danger');
-    }
-}
-
-async function renewClientCert(instanceId, clientName) {
-    if (!confirm(`Rinnovare il certificato per "${clientName}"? Il client dovrà riscaricare la configurazione.`)) return;
-
-    try {
-        const response = await fetch(
-            `${MODULE_BASE}/instances/${instanceId}/clients/${clientName}/renew`,
-            { method: 'POST' }
-        );
-        if (!response.ok) throw new Error('Errore rinnovo certificato');
-        showToast('Certificato rinnovato', 'success');
-        showInstanceDetail(instanceId);
-    } catch (error) {
-        showToast(error.message, 'danger');
-    }
-}
-
-async function renewServerCert(instanceId) {
-    if (!confirm('Rinnovare il certificato server? L\'istanza verrà riavviata.')) return;
-
-    try {
-        const response = await fetch(
-            `${MODULE_BASE}/instances/${instanceId}/pki/renew-server`,
-            { method: 'POST' }
-        );
-        if (!response.ok) throw new Error('Errore rinnovo certificato');
-        showToast('Certificato server rinnovato', 'success');
-        showInstanceDetail(instanceId);
-    } catch (error) {
-        showToast(error.message, 'danger');
-    }
-}
-
-async function showClientQR(instanceId, clientName) {
-    window.open(`${MODULE_BASE}/instances/${instanceId}/clients/${clientName}/qr`, '_blank');
-}
-
-// =============================================================================
-// UTILITIES
-// =============================================================================
-
-function escapeHtml(text) {
-    const div = document.createElement('div');
-    div.textContent = text;
-    return div.innerHTML;
-}
-
-function formatDate(dateStr) {
-    if (!dateStr) return 'N/A';
-    return new Date(dateStr).toLocaleDateString('it-IT', {
-        year: 'numeric',
-        month: 'long',
-        day: 'numeric'
-    });
-}
-
-function getDaysRemaining(dateStr) {
-    if (!dateStr) return null;
-    const expiry = new Date(dateStr);
-    const now = new Date();
-    return Math.floor((expiry - now) / (1000 * 60 * 60 * 24));
-}
-
-function showToast(message, type = 'info') {
-    // Use MADMIN's toast system if available
-    if (window.showGlobalToast) {
-        window.showGlobalToast(message, type);
-    } else {
-        alert(message);
-    }
-}
-
-// Initialize on load
-init();
+});
