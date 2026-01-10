@@ -1,14 +1,13 @@
 {
     "id": "openvpn",
     "name": "OpenVPN Manager",
-    "version": "0.2.0",
+    "version": "0.3.0",
     "description": "OpenVPN server and client management with PKI, certificate generation, and multi-instance support",
     "author": "MADMIN Team",
     "system_dependencies": {
         "apt": [
             "openvpn",
-            "easy-rsa",
-            "openssl"
+            "easy-rsa"
         ],
         "pip": [
             "qrcode>=7.3"
@@ -62,6 +61,12 @@
         {
             "name": "MOD_OVPN_FORWARD",
             "parent": "FORWARD",
+            "priority": 50
+        },
+        {
+            "name": "MOD_OVPN_NAT",
+            "parent": "POSTROUTING",
+            "table": "nat",
             "priority": 50
         }
     ],

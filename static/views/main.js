@@ -96,8 +96,8 @@ async function renderInstanceList(container) {
                             <div class="col-md-3 mb-3">
                                 <label class="form-label">Protocollo</label>
                                 <select class="form-select" id="new-instance-protocol">
-                                    <option value="udp" selected>UDP</option>
-                                    <option value="tcp">TCP</option>
+                                    <option value="udp">UDP</option>
+                                    <option value="tcp" selected>TCP</option>
                                 </select>
                             </div>
                         </div>
@@ -480,7 +480,7 @@ async function renderInstanceDetail(container) {
                                             <th>IP Assegnato</th>
                                             <th>Certificato</th>
                                             <th>Traffico</th>
-                                            <th>Ultima Connessione</th>
+                                            <th>Connesso da</th>
                                             <th class="w-1">Azioni</th>
                                         </tr>
                                     </thead>
@@ -510,7 +510,7 @@ async function renderInstanceDetail(container) {
                                                 <td>
                                                     ${c.last_connection
                 ? `<small class="text-muted">${formatTimeAgo(c.last_connection)}</small>`
-                : '<small class="text-muted">Mai connesso</small>'
+                : '<small class="text-muted">-</small>'
             }
                                                 </td>
                                                 <td>

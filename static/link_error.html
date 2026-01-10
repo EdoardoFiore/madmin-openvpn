@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="it">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Link Scaduto</title>
+    <link href="https://cdn.jsdelivr.net/npm/@tabler/core@1.0.0-beta21/dist/css/tabler.min.css" rel="stylesheet">
+    <link href="https://cdn.jsdelivr.net/npm/@tabler/icons-webfont@3.30.0/dist/tabler-icons.min.css" rel="stylesheet">
+    <style>
+        body {
+            background: #f1f5f9;
+            min-height: 100vh;
+        }
+
+        .error-card {
+            max-width: 500px;
+            margin: 0 auto;
+        }
+
+        .error-icon {
+            font-size: 4rem;
+            color: #d63939;
+        }
+    </style>
+</head>
+
+<body class="d-flex align-items-center py-4">
+    <div class="container">
+        <div class="row justify-content-center">
+            <div class="col-lg-6">
+                <div class="card error-card shadow-lg text-center">
+                    <div class="card-body py-5">
+                        <i class="ti ti-link-off error-icon mb-3"></i>
+                        <h2 class="mb-3">{title}</h2>
+                        <p class="text-muted mb-4">{message}</p>
+                        <div class="alert alert-light">
+                            <i class="ti ti-info-circle me-2"></i>
+                            <small>Se hai bisogno di accedere alla configurazione VPN, contatta l'amministratore per
+                                richiedere un nuovo link.</small>
+                        </div>
+                    </div>
+                </div>
+                <div class="text-center text-muted mt-4">
+                    <small>Powered by MADMIN</small>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/@tabler/core@1.0.0-beta21/dist/js/tabler.min.js"></script>
+</body>
+
+</html>

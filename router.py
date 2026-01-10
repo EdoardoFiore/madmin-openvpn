@@ -11,7 +11,8 @@ from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Response
 from fastapi.responses import HTMLResponse
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func
+from sqlalchemy import select, func, delete
+from sqlmodel import SQLModel
 import secrets
 import qrcode
 
@@ -177,6 +178,37 @@ async def get_instance(
     )
 
 
+class OvpnInstanceUpdate(SQLModel):
+    """Schema for updating instance settings."""
+    name: Optional[str] = None
+    endpoint: Optional[str] = None
+
+
+@router.patch("/instances/{instance_id}")
+async def update_instance(
+    instance_id: str,
+    data: OvpnInstanceUpdate,
+    db: AsyncSession = Depends(get_session),
+    _user: User = Depends(require_permission("openvpn.manage"))
+):
+    """Update instance settings (name, endpoint)."""
+    result = await db.execute(select(OvpnInstance).where(OvpnInstance.id == instance_id))
+    instance = result.scalar_one_or_none()
+    if not instance:
+        raise HTTPException(404, "Instance not found")
+    
+    # Update fields
+    if data.name is not None:
+        instance.name = data.name
+    if data.endpoint is not None:
+        instance.endpoint = data.endpoint if data.endpoint else None
+    
+    instance.updated_at = datetime.utcnow()
+    await db.commit()
+    
+    return {"success": True, "message": "Instance updated"}
+
+
 @router.delete("/instances/{instance_id}", status_code=204)
 async def delete_instance(
     instance_id: str,
@@ -204,6 +236,16 @@ async def delete_instance(
     if config_path.exists():
         config_path.unlink()
     
+    # Delete magic tokens (no cascade configured on DB)
+    from .models import OvpnMagicToken, OvpnClient
+    await db.execute(
+        delete(OvpnMagicToken).where(
+            OvpnMagicToken.client_id.in_(
+                select(OvpnClient.id).where(OvpnClient.instance_id == instance_id)
+            )
+        )
+    )
+
     # Delete from database (cascades to clients, groups, etc.)
     await db.delete(instance)
     await db.commit()
@@ -406,9 +448,22 @@ async def list_clients(
     connected_map = {c['common_name']: c for c in connected}
     
     response = []
+    
     for client in clients:
         conn_info = connected_map.get(client.name, {})
         
+        live_connected_since = None
+        if conn_info and conn_info.get('connected_since'):
+            try:
+                # Parse date: 2026-01-10 17:29:06
+                live_connected_since = datetime.strptime(conn_info['connected_since'], "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                # Fallback or ignore parse error
+                pass
+        
+        # Use live connection time if available, otherwise None (as requested by user to avoid stale data)
+        display_last_connection = live_connected_since
+
         response.append(OvpnClientRead(
             id=client.id,
             name=client.name,
@@ -417,8 +472,9 @@ async def list_clients(
             cert_days_remaining=openvpn_service.get_cert_days_remaining(client.cert_expiry) if client.cert_expiry else None,
             revoked=client.revoked,
             created_at=client.created_at,
-            last_connection=client.last_connection,
+            last_connection=display_last_connection,
             is_connected=bool(conn_info),
+            connected_since=live_connected_since,
             bytes_received=conn_info.get('bytes_received'),
             bytes_sent=conn_info.get('bytes_sent'),
         ))
@@ -857,32 +913,30 @@ async def send_client_config_email(
 
 async def _validate_token(token: str, db: AsyncSession):
     """
-    Validate magic token and return (magic_token, client, instance) or raise HTTPException.
-    Does NOT mark token as used.
+    Validate magic token and return (magic_token, client, instance, error) tuple.
+    If error is not None, it contains (title, message) for the error page.
+    Token can be used multiple times within validity period.
     """
     result = await db.execute(select(OvpnMagicToken).where(OvpnMagicToken.token == token))
     magic_token = result.scalar_one_or_none()
     
     if not magic_token:
-        raise HTTPException(404, "Link non valido o scaduto")
-    
-    if magic_token.used:
-        raise HTTPException(410, "Questo link è già stato utilizzato")
+        return None, None, None, ("Link non valido", "Questo link di download non esiste o è stato rimosso.")
     
     if magic_token.expires_at < datetime.utcnow():
-        raise HTTPException(410, "Questo link è scaduto")
+        return None, None, None, ("Link scaduto", "Questo link di download è scaduto. Richiedi un nuovo link all'amministratore.")
     
     result = await db.execute(select(OvpnClient).where(OvpnClient.id == magic_token.client_id))
     client = result.scalar_one_or_none()
     if not client:
-        raise HTTPException(404, "Client non trovato")
+        return None, None, None, ("Client non trovato", "Il client associato a questo link non esiste più.")
     
     result = await db.execute(select(OvpnInstance).where(OvpnInstance.id == client.instance_id))
     instance = result.scalar_one_or_none()
     if not instance:
-        raise HTTPException(404, "Istanza non trovata")
+        return None, None, None, ("Istanza non trovata", "L'istanza VPN associata non esiste più.")
     
-    return magic_token, client, instance
+    return magic_token, client, instance, None
 
 
 @router.get("/download/{token}", response_class=HTMLResponse)
@@ -896,7 +950,15 @@ async def download_landing_page(
     """
     from pathlib import Path
     
-    magic_token, client, instance = await _validate_token(token, db)
+    magic_token, client, instance, error = await _validate_token(token, db)
+    
+    # If error, show error page
+    if error:
+        error_template = Path(__file__).parent / "static" / "link_error.html"
+        html_content = error_template.read_text(encoding="utf-8")
+        html_content = html_content.replace("{title}", error[0])
+        html_content = html_content.replace("{message}", error[1])
+        return HTMLResponse(content=html_content, status_code=410)
     
     # Load and render template
     template_path = Path(__file__).parent / "static" / "download_page.html"
@@ -922,19 +984,24 @@ async def download_config_file(
 ):
     """
     Download the actual .ovpn file.
-    Marks the token as used after successful download.
+    Can be downloaded multiple times within validity period.
     """
     from .service import get_public_ip
+    from pathlib import Path
     
-    magic_token, client, instance = await _validate_token(token, db)
+    magic_token, client, instance, error = await _validate_token(token, db)
+    
+    # If error, show error page
+    if error:
+        error_template = Path(__file__).parent / "static" / "link_error.html"
+        html_content = error_template.read_text(encoding="utf-8")
+        html_content = html_content.replace("{title}", error[0])
+        html_content = html_content.replace("{message}", error[1])
+        return HTMLResponse(content=html_content, status_code=410)
     
     # Generate config
     endpoint = instance.endpoint or get_public_ip() or "YOUR_SERVER_IP"
     config = openvpn_service.generate_client_config(instance, client, endpoint)
-    
-    # Mark token as used
-    magic_token.used = True
-    await db.commit()
     
     return Response(
         content=config,
@@ -1278,7 +1345,7 @@ async def reorder_rules(
 # FIREWALL POLICY
 # =========================================================================
 
-@router.patch("/instances/{instance_id}/firewall/policy")
+@router.patch("/instances/{instance_id}/firewall-policy")
 async def update_firewall_policy(
     instance_id: str,
     data: FirewallPolicyUpdate,

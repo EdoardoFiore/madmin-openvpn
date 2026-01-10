@@ -3,9 +3,7 @@ OpenVPN Module - Post Install Hook
 
 Executed after module installation:
 - Creates necessary directories
-- Initializes firewall chains
 - Enables IP forwarding
-- Creates log directory
 """
 import subprocess
 import logging
@@ -45,47 +43,4 @@ async def run():
     except Exception as e:
         logger.warning(f"Could not enable IP forwarding: {e}")
     
-    # 3. Initialize firewall chains
-    chains = [
-        ("filter", "MOD_OVPN_INPUT"),
-        ("filter", "MOD_OVPN_FORWARD"),
-        ("nat", "MOD_OVPN_NAT"),
-    ]
-    
-    for table, chain in chains:
-        # Create chain if not exists
-        subprocess.run(
-            ["iptables", "-t", table, "-N", chain],
-            capture_output=True
-        )
-        # Add RETURN at end
-        subprocess.run(
-            ["iptables", "-t", table, "-A", chain, "-j", "RETURN"],
-            capture_output=True
-        )
-        logger.info(f"Created firewall chain: {chain}")
-    
-    # 4. Create symlinks to module chains from MADMIN chains
-    # This depends on core MADMIN chains existing
-    jump_rules = [
-        ("filter", "MADMIN_INPUT", "MOD_OVPN_INPUT"),
-        ("filter", "MADMIN_FORWARD", "MOD_OVPN_FORWARD"),
-        ("nat", "MADMIN_POSTROUTING", "MOD_OVPN_NAT"),
-    ]
-    
-    for table, parent, chain in jump_rules:
-        # Check if rule exists
-        result = subprocess.run(
-            ["iptables", "-t", table, "-C", parent, "-j", chain],
-            capture_output=True
-        )
-        if result.returncode != 0:
-            # Add jump rule
-            subprocess.run(
-                ["iptables", "-t", table, "-A", parent, "-j", chain],
-                capture_output=True
-            )
-            logger.info(f"Added jump rule: {parent} -> {chain}")
-    
     logger.info("OpenVPN post-install complete")
-    return True

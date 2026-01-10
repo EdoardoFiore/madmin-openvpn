@@ -250,6 +250,9 @@ class OpenVPNService:
             # Regenerate CRL
             OpenVPNService.regenerate_crl(instance_id)
             
+            # Immediately disconnect the client
+            OpenVPNService.kill_client(instance_id, client_name)
+            
             # Remove cert files
             for ext in [".crt", ".key", ".req"]:
                 cert_file = easyrsa_dir / "pki" / "issued" / f"{client_name}{ext}"
@@ -476,8 +479,8 @@ class OpenVPNService:
             f"log-append /var/log/openvpn/{instance.id}.log",
             "verb 3",
             "",
-            "# Management interface for status queries",
-            f"management 127.0.0.1 {7500 + hash(instance.id) % 100}",
+            "# Management interface",
+            f"management {OpenVPNService.get_management_socket(instance.id)} unix",
         ]
         
         # DNS servers
@@ -566,21 +569,42 @@ class OpenVPNService:
         tls_server_key = instance_dir / "tls-crypt-v2.key"
         if tls_server_key.exists():
             # Generate per-client tls-crypt-v2 key
+            # Use temp file for output to avoid issues with /dev/stdout
+            import tempfile
+            import os
+            
+            with tempfile.NamedTemporaryFile(mode='w+', delete=False) as tmp:
+                tmp_path = tmp.name
+            
             try:
                 result = subprocess.run(
                     ["openvpn", "--tls-crypt-v2", str(tls_server_key),
-                     "--genkey", "tls-crypt-v2-client", "/dev/stdout"],
+                     "--genkey", "tls-crypt-v2-client", tmp_path],
                     capture_output=True,
                     text=True
                 )
+                
                 if result.returncode == 0:
+                    # Read generated key
+                    with open(tmp_path, 'r') as f:
+                        key_content = f.read()
+                        
                     config_lines.extend([
                         "<tls-crypt-v2>",
-                        result.stdout.strip(),
+                        key_content.strip(),
                         "</tls-crypt-v2>",
                     ])
+                else:
+                    raise RuntimeError(f"OpenVPN key gen failed (code {result.returncode}). Stdout: {result.stdout}, Stderr: {result.stderr}")
+
             except Exception as e:
-                logger.warning(f"Could not generate tls-crypt-v2 client key: {e}")
+                logger.error(f"Could not generate tls-crypt-v2 client key. Command output: {e.stderr if hasattr(e, 'stderr') else str(e)}")
+                # This is critical for connection, so we shouldn't fail silently
+                # If we return partial config, connection will fail with "TLS Error: could not determine wrapping"
+                raise RuntimeError(f"Failed to generate tls-crypt-v2 key: {e}")
+            finally:
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
         
         return "\n".join(config_lines)
     
@@ -601,7 +625,68 @@ class OpenVPNService:
             return True
         except subprocess.CalledProcessError as e:
             logger.error(f"Failed to start instance: {e}")
+            return True
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Failed to start instance: {e}")
             return False
+            
+    @staticmethod
+    def get_management_socket(instance_id: str) -> Path:
+        """Get management socket path."""
+        return Path(f"/var/run/openvpn/mgmt_{instance_id}.sock")
+            
+    @staticmethod
+    def send_management_command(instance_id: str, command: str) -> str:
+        """Send command to OpenVPN management interface."""
+        import socket
+        
+        sock_path = OpenVPNService.get_management_socket(instance_id)
+        if not sock_path.exists():
+            return ""
+            
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                s.settimeout(5.0)  # 5 second timeout
+                s.connect(str(sock_path))
+                
+                # Use file object for easier line reading
+                f = s.makefile('r', encoding='utf-8')
+                
+                # Consume banner (wait for it to stop sending or just read first lines?)
+                # Banner usually starts immediately. We can just ignore it or read until we can send.
+                # Actually, standard OpenVPN management does not send a prompt by default unless 'state on' etc.
+                # We can just send the command. But we might have pending banner data in buffer.
+                # It's safer to just send.
+                
+                s.sendall(f"{command}\n".encode())
+                
+                response = ""
+                while True:
+                    line = f.readline()
+                    if not line:
+                        break
+                    
+                    response += line
+                    
+                    # Check for termination conditions
+                    if line.strip() == "END":
+                        break
+                    if line.startswith("SUCCESS:") or line.startswith("ERROR:"):
+                        # Single line commands like 'kill' return immediate status
+                        break
+                
+                s.sendall(b"quit\n")
+                return response
+        except Exception as e:
+            logger.error(f"Management command failed: {e}")
+            return ""
+            
+    @staticmethod
+    def kill_client(instance_id: str, client_name: str) -> bool:
+        """Disconnect a connected client immediately."""
+        logger.info(f"Killing client {client_name} on instance {instance_id}")
+        response = OpenVPNService.send_management_command(instance_id, f"kill {client_name}")
+        return "SUCCESS" in response
     
     @staticmethod
     def stop_instance(instance_id: str) -> bool:
@@ -634,33 +719,67 @@ class OpenVPNService:
     @staticmethod
     def get_connected_clients(instance_id: str) -> List[Dict]:
         """Get list of connected clients via status file."""
-        status_file = Path(f"/var/log/openvpn/status_{instance_id}.log")
-        connected = []
+        # Check standard systemd path first, then config path
+        possible_paths = [
+            Path(f"/run/openvpn-server/status-{instance_id}.log"),
+            Path(f"/var/log/openvpn/status_{instance_id}.log")
+        ]
         
-        if not status_file.exists():
+        status_file = None
+        for p in possible_paths:
+            if p.exists():
+                status_file = p
+                break
+        
+        connected = []
+        if not status_file:
             return connected
         
         try:
             content = status_file.read_text()
-            # Parse status file format
-            in_clients = False
+            
+            # Detect version 2 (starts with TITLE, has HEADER)
+            is_v2 = "CLIENT_LIST" in content
+            
             for line in content.split('\n'):
-                if line.startswith('ROUTING TABLE'):
-                    break
-                if in_clients and ',' in line:
-                    parts = line.split(',')
-                    if len(parts) >= 5:
-                        connected.append({
-                            'common_name': parts[0],
-                            'real_address': parts[1],
-                            'bytes_received': int(parts[2]) if parts[2].isdigit() else 0,
-                            'bytes_sent': int(parts[3]) if parts[3].isdigit() else 0,
-                            'connected_since': parts[4],
-                        })
-                if line.startswith('Common Name'):
-                    in_clients = True
+                line = line.strip()
+                if not line:
+                    continue
+                    
+                if is_v2:
+                    if line.startswith('CLIENT_LIST'):
+                        # TIME,HEADER fields show:
+                        # CLIENT_LIST,CommonName,RealAddress,VirtualAddress,VirtualIPv6,BytesReceived,BytesSent,ConnectedSince,...
+                        parts = line.split(',')
+                        if len(parts) >= 8:
+                            connected.append({
+                                'common_name': parts[1],
+                                'real_address': parts[2],
+                                'virtual_address': parts[3],
+                                'bytes_received': int(parts[5]) if parts[5].isdigit() else 0,
+                                'bytes_sent': int(parts[6]) if parts[6].isdigit() else 0,
+                                'connected_since': parts[7],
+                            })
+                else:
+                    # Version 1 parsing
+                    if line.startswith('ROUTING TABLE'):
+                        break
+                    # V1 client list section typically starts after "Common Name,..." header
+                    # But reliable way involves skipping headers
+                    if ',' in line and not line.startswith('Updated') and not line.startswith('Common Name'):
+                        parts = line.split(',')
+                        if len(parts) >= 5:
+                            connected.append({
+                                'common_name': parts[0],
+                                'real_address': parts[1],
+                                # V1 doesn't always show VIP in client list, but in routing table
+                                'bytes_received': int(parts[2]) if parts[2].isdigit() else 0,
+                                'bytes_sent': int(parts[3]) if parts[3].isdigit() else 0,
+                                'connected_since': parts[4],
+                            })
+                            
         except Exception as e:
-            logger.error(f"Failed to parse status file: {e}")
+            logger.error(f"Failed to parse status file {status_file}: {e}")
         
         return connected
     
@@ -852,9 +971,9 @@ class OpenVPNService:
                 "-A", forward_chain, "-i", interface, "-j", "DROP"
             ])
         else:
-            OpenVPNService._run_iptables("filter", [
-                "-A", forward_chain, "-i", interface, "-j", "ACCEPT"
-            ])
+             # Basic ACCEPT for traffic originating from the interface (e.g. client updates/pings to server)
+             # But prevent generic "accept everything from interface" which bypasses policy
+             pass
         
         # NAT rules
         if tunnel_mode == "split" and routes:
@@ -957,6 +1076,23 @@ class OpenVPNService:
         result = await db.execute(select(OvpnGroup).where(OvpnGroup.instance_id == instance_id))
         groups = result.scalars().all()
         
+        # 1. Cleanup all existing group jump rules from the instance forward chain
+        # Get current rules
+        proc = subprocess.run(
+            ["iptables", "-t", "filter", "-S", instance_fwd_chain],
+            capture_output=True, text=True
+        )
+        if proc.returncode == 0:
+            for line in proc.stdout.splitlines():
+                # Line format: -A OVPN_tun0_FWD -s 10.8.0.2/32 -j OVPN_GRP_foo
+                if "-j OVPN_GRP_" in line:
+                    parts = line.split()
+                    # Reconstruct delete command
+                    # remove '-A'
+                    if parts[0] == '-A':
+                        parts[0] = '-D'
+                        OpenVPNService._run_iptables("filter", parts)
+
         for group in groups:
             group_chain = f"OVPN_GRP_{group.id.replace(instance_id + '_', '')}"
             
@@ -1021,18 +1157,42 @@ class OpenVPNService:
                 ])
                 
                 logger.info(f"  Added rule: {client_ip} -> {group_chain}")
+                
+            # Cleanup stale jump rules ( IPs that are no longer in groups or moved groups)
+            # This is tricky because we only know current members.
+            # Best approach: Get ALL jump rules in the chain, identify those jumping to OVPN_GRP_*,
+            # and verify if they match valid members.
+            
+            # For strict correctness and performance, we can just FLUSH all jump rules from the chain
+            # that target ANY OVPN_GRP_* chain, and rebuild them.
+            # But we are inside a loop over groups... efficient?
+            
+            # Alternative: modifying the loop logic.
+            # 1. Collect all VALID (ip, group_chain) pairs.
+            # 2. Flush existing OVPN_GRP_* jumps from instance chain.
+            # 3. Apply all pairs.
+            
+            # Since this function iterates all groups, we can accumulate rules and apply them at the end?
+            # Or assume we just keep adding rules and rely on `remove_member` to clean up?
+            # Revocation calls this function but the client is NOT in `members` anymore.
+            # So `remove_member` specific logic is skipped.
+            
+            # Fix: At the start of this function (before group loop), iterate the forward chain
+            # and remove ALL jumps to OVPN_GRP_*.
+            pass
         
         # After processing all groups, update the instance forward chain to use the default policy
-        # Remove old generic rules (they'll be at the end)
-        OpenVPNService._run_iptables("filter", [
-            "-D", instance_fwd_chain, "-j", "ACCEPT"
-        ], suppress_errors=True)
-        OpenVPNService._run_iptables("filter", [
-            "-D", instance_fwd_chain, "-j", "RETURN"
-        ], suppress_errors=True)
-        OpenVPNService._run_iptables("filter", [
-            "-D", instance_fwd_chain, "-j", "DROP"
-        ], suppress_errors=True)
+        
+        # Remove old policy rules (ACCEPT, DROP, RETURN) from the end
+        # We try to delete them multiple times to be safe
+        for target in ["ACCEPT", "DROP", "RETURN"]:
+            OpenVPNService._run_iptables("filter", [
+                "-D", instance_fwd_chain, "-j", target
+            ], suppress_errors=True)
+            # Try again just in case multiple were added
+            OpenVPNService._run_iptables("filter", [
+                "-D", instance_fwd_chain, "-j", target
+            ], suppress_errors=True)
         
         # Add the instance default policy at the end (for non-grouped clients)
         OpenVPNService._run_iptables("filter", [
