@@ -229,7 +229,7 @@ async def delete_instance(
     await OpenVPNService.remove_all_group_chains(instance.id, db)
     
     # Remove instance firewall rules
-    openvpn_service.remove_instance_firewall_rules(instance_id)
+    openvpn_service.remove_instance_firewall_rules(instance_id, instance.interface)
     
     # Delete config file
     config_path = OPENVPN_BASE_DIR / f"{instance_id}.conf"
@@ -276,7 +276,8 @@ async def start_instance(
         openvpn_service.apply_instance_firewall_rules(
             instance_id, instance.port, instance.protocol,
             instance.interface, instance.subnet,
-            instance.tunnel_mode, instance.routes
+            instance.tunnel_mode, instance.routes,
+            instance.firewall_default_policy
         )
         # Also apply group rules (member jumps, default policy)
         from .service import OpenVPNService
@@ -301,7 +302,7 @@ async def stop_instance(
         # Remove firewall rules when interface stops
         from .service import OpenVPNService
         await OpenVPNService.remove_all_group_chains(instance.id, db)
-        openvpn_service.remove_instance_firewall_rules(instance_id)
+        openvpn_service.remove_instance_firewall_rules(instance_id, instance.interface)
         return {"status": "stopped"}
     raise HTTPException(500, "Failed to stop instance")
 
@@ -345,7 +346,8 @@ async def update_instance_routing(
         openvpn_service.apply_instance_firewall_rules(
             instance_id, instance.port, instance.protocol,
             instance.interface, instance.subnet,
-            instance.tunnel_mode, instance.routes
+            instance.tunnel_mode, instance.routes,
+            instance.firewall_default_policy
         )
     
     return {
@@ -1026,6 +1028,9 @@ async def list_groups(
     )
     groups = result.scalars().all()
     
+    # Sort by order field
+    groups = sorted(groups, key=lambda g: g.order)
+    
     response = []
     for group in groups:
         # Count members
@@ -1066,14 +1071,44 @@ async def create_group(
     if not inst_result.scalar_one_or_none():
         raise HTTPException(404, "Instance not found")
     
-    # Generate group ID
-    group_id = f"{instance_id}_{re.sub(r'[^a-z0-9]', '', data.name.lower())}"
+    # Generate group ID and sanitized name
+    sanitized_name = re.sub(r'[^a-z0-9]', '', data.name.lower())
+    group_id = f"{instance_id}_{sanitized_name}"
+    
+    # Check for chain name collision due to truncation
+    # Chain names are truncated to 8 chars for instance and 8 chars for group
+    chain_id = instance_id.replace('tun', '') if instance_id.startswith('tun') else instance_id
+    truncated_inst = chain_id[:8]
+    truncated_group = sanitized_name[:8]
+    
+    # Get all existing groups for this instance
+    result = await db.execute(select(OvpnGroup).where(OvpnGroup.instance_id == instance_id))
+    existing_groups = result.scalars().all()
+    
+    for existing in existing_groups:
+        existing_name = existing.id.replace(instance_id + '_', '')
+        if existing_name[:8] == truncated_group:
+            # Collision detected!
+            raise HTTPException(
+                400, 
+                f"Nome gruppo causa collisione con '{existing.name}' - "
+                f"entrambi iniziano con '{truncated_group}'. "
+                f"Scegli un nome che NON inizi con '{truncated_group}'."
+            )
+    
+    # Get next order value for this instance
+    max_order_result = await db.execute(
+        select(func.max(OvpnGroup.order)).where(OvpnGroup.instance_id == instance_id)
+    )
+    max_order = max_order_result.scalar() or 0
+    next_order = max_order + 1
     
     group = OvpnGroup(
         id=group_id,
         instance_id=instance_id,
         name=data.name,
-        description=data.description
+        description=data.description,
+        order=next_order
     )
     db.add(group)
     await db.commit()
@@ -1098,10 +1133,44 @@ async def delete_group(
     
     # IMPORTANT: Remove firewall rules BEFORE deleting from DB
     # so we still have member info to remove jump rules
-    await openvpn_service.remove_group_firewall_rules(instance_id, group_id, group.name, db)
+    # Use sanitized name from group.id (same as creation) to ensure chain name matches
+    sanitized_group_name = group.id.replace(instance_id + '_', '')
+    await openvpn_service.remove_group_firewall_rules(instance_id, group_id, sanitized_group_name, db)
     
     await db.delete(group)
     await db.commit()
+
+
+class GroupOrderUpdate(SQLModel):
+    """Schema for updating group order."""
+    group_id: str
+    order: int
+
+
+@router.put("/instances/{instance_id}/groups/order")
+async def reorder_groups(
+    instance_id: str,
+    orders: List[GroupOrderUpdate],
+    db: AsyncSession = Depends(get_session),
+    _user: User = Depends(require_permission("openvpn.manage"))
+):
+    """Update group order for an instance. Lower order = higher priority in iptables."""
+    for item in orders:
+        result = await db.execute(
+            select(OvpnGroup).where(
+                (OvpnGroup.id == item.group_id) & (OvpnGroup.instance_id == instance_id)
+            )
+        )
+        group = result.scalar_one_or_none()
+        if group:
+            group.order = item.order
+    await db.commit()
+    
+    # Re-apply firewall rules to reflect new order
+    from .service import OpenVPNService
+    await OpenVPNService.apply_group_firewall_rules(instance_id, db)
+    
+    return {"status": "ok"}
 
 
 # =========================================================================

@@ -40,6 +40,7 @@ export async function init(container, instanceId) {
         }
 
         render(container);
+        setupGroupOrdering();
 
         // Load group details if a group is selected
         if (currentGroupId) {
@@ -76,7 +77,11 @@ function render(container) {
             <div class="col-md-4">
                 <div class="card">
                     <div class="card-header d-flex justify-content-between align-items-center">
-                        <h4 class="card-title mb-0">Gruppi</h4>
+                        <div class="d-flex align-items-center gap-2">
+                            <h4 class="card-title mb-0">Gruppi</h4>
+                            <i class="ti ti-info-circle text-muted" data-bs-toggle="tooltip" 
+                               title="L'ordine dei gruppi determina la priorità nel firewall. I gruppi in alto hanno priorità maggiore (le loro regole vengono valutate prima). Trascina per riordinare."></i>
+                        </div>
                         ${canManageGroups ? `
                         <button class="btn btn-sm btn-primary" id="btn-new-group">
                             <i class="ti ti-plus me-1"></i>Nuovo
@@ -204,19 +209,21 @@ function renderGroupsList() {
     }
 
     return groups.map(g => `
-        <a href="#" class="list-group-item list-group-item-action ${g.id === currentGroupId ? 'active' : ''}"
-           data-group-id="${g.id}">
-            <div class="d-flex justify-content-between align-items-center">
-                <div>
-                    <strong>${g.name}</strong>
-                    <small class="d-block ${g.id === currentGroupId ? 'text-white-50' : 'text-muted'}">${g.description || 'Nessuna descrizione'}</small>
+        <div class="list-group-item list-group-item-action ${g.id === currentGroupId ? 'active' : ''} d-flex align-items-center p-0" data-group-id="${g.id}">
+            ${canManageGroups ? `<div class="px-2 py-3 cursor-move group-drag-handle ${g.id === currentGroupId ? 'text-reset' : 'text-muted'}"><i class="ti ti-grip-vertical"></i></div>` : ''}
+            <a href="#" class="flex-grow-1 p-3 text-decoration-none text-reset" onclick="event.preventDefault(); selectGroup('${g.id}')">
+                <div class="d-flex justify-content-between align-items-center">
+                    <div>
+                        <strong>${g.name}</strong>
+                        <small class="d-block ${g.id === currentGroupId ? 'text-reset opacity-75' : 'text-muted'}">${g.description || 'Nessuna descrizione'}</small>
+                    </div>
+                    <div class="d-flex gap-1">
+                        <span class="badge ${g.id === currentGroupId ? 'bg-white text-primary' : 'bg-blue-lt text-blue'}">${g.member_count} <i class="ti ti-users"></i></span>
+                        <span class="badge ${g.id === currentGroupId ? 'bg-white text-primary' : 'bg-green-lt text-green'}">${g.rule_count} <i class="ti ti-shield"></i></span>
+                    </div>
                 </div>
-                <div class="d-flex gap-1">
-                    <span class="badge bg-blue-lt text-blue">${g.member_count} <i class="ti ti-users"></i></span>
-                    <span class="badge bg-green-lt text-green">${g.rule_count} <i class="ti ti-shield"></i></span>
-                </div>
-            </div>
-        </a>
+            </a>
+        </div>
     `).join('');
 }
 
@@ -567,6 +574,49 @@ window.editRule = async (ruleId) => {
     new bootstrap.Modal(modal).show();
 };
 
+window.selectGroup = (groupId) => {
+    currentGroupId = groupId;
+    loadGroupDetails();
+    refreshGroupsList(); // To update active state
+};
+
+function setupGroupOrdering() {
+    const listEl = document.getElementById('groups-list');
+    if (!listEl || typeof Sortable === 'undefined' || !canManageGroups) return;
+
+    new Sortable(listEl, {
+        animation: 150,
+        handle: '.group-drag-handle',
+        onEnd: async function (evt) {
+            // Collect new order
+            const items = listEl.querySelectorAll('[data-group-id]');
+            const orders = [];
+            items.forEach((item, index) => {
+                orders.push({
+                    group_id: item.dataset.groupId,
+                    order: index
+                });
+            });
+
+            // Save to API
+            try {
+                await apiPut(`${MODULE_API}/instances/${currentInstanceId}/groups/order`, orders);
+                showToast('Ordine gruppi aggiornato', 'success');
+                // Update local groups array order
+                const newGroups = [];
+                items.forEach(item => {
+                    const group = groups.find(g => g.id === item.dataset.groupId);
+                    if (group) newGroups.push(group);
+                });
+                groups = newGroups;
+            } catch (err) {
+                showToast(err.message, 'error');
+                refreshGroupsList(); // Reset UI on error
+            }
+        }
+    });
+}
+
 // Refresh groups list (updates member/rule counts)
 async function refreshGroupsList() {
     try {
@@ -574,16 +624,7 @@ async function refreshGroupsList() {
         const listEl = document.getElementById('groups-list');
         if (listEl) {
             listEl.innerHTML = renderGroupsList();
-            // Re-attach click handlers
-            listEl.querySelectorAll('[data-group-id]').forEach(el => {
-                el.addEventListener('click', (e) => {
-                    e.preventDefault();
-                    currentGroupId = e.currentTarget.dataset.groupId;
-                    document.querySelectorAll('[data-group-id]').forEach(g => g.classList.remove('active'));
-                    e.currentTarget.classList.add('active');
-                    loadGroupDetails();
-                });
-            });
+            setupGroupOrdering();
         }
     } catch (err) {
         console.error('Failed to refresh groups list:', err);
