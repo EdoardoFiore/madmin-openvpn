@@ -35,62 +35,60 @@ async def run():
     except Exception as e:
         logger.warning(f"Error stopping services: {e}")
     
-    # 2. Remove group chains (OVPN_GRP_*) from filter table
-    try:
-        result = subprocess.run(
-            ["iptables", "-t", "filter", "-L", "-n", "--line-numbers"],
-            capture_output=True,
-            text=True
-        )
-        # Find and delete group chains
-        for line in result.stdout.split('\n'):
-            if 'Chain OVPN_GRP_' in line:
-                chain_name = line.split()[1]
-                subprocess.run(["iptables", "-t", "filter", "-F", chain_name], capture_output=True)
-                subprocess.run(["iptables", "-t", "filter", "-X", chain_name], capture_output=True)
-                logger.info(f"Removed group chain: {chain_name}")
-    except Exception as e:
-        logger.warning(f"Error removing group chains: {e}")
-    
-    # 3. Remove per-instance chains (OVPN_{instance}_INPUT, _FWD, _NAT)
-    server_dir = Path("/etc/openvpn/server")
-    if server_dir.exists():
-        for instance_dir in server_dir.iterdir():
-            if instance_dir.is_dir() and not instance_dir.name.startswith('.'):
-                instance_id = instance_dir.name
-                # Filter table chains
-                for suffix in ["_INPUT", "_FWD"]:
-                    chain = f"OVPN_{instance_id}{suffix}"
-                    subprocess.run(["iptables", "-t", "filter", "-F", chain], capture_output=True)
-                    subprocess.run(["iptables", "-t", "filter", "-X", chain], capture_output=True)
-                # NAT table chain
-                for suffix in ["_NAT"]:
-                    chain = f"OVPN_{instance_id}{suffix}"
-                    subprocess.run(["iptables", "-t", "nat", "-F", chain], capture_output=True)
-                    subprocess.run(["iptables", "-t", "nat", "-X", chain], capture_output=True)
-                logger.info(f"Removed instance chains for: {instance_id}")
-    
-    # 4. Remove jump rules from parent module chains
-    jump_rules = [
-        ("filter", "MOD_OVPN_INPUT"),
-        ("filter", "MOD_OVPN_FORWARD"),
-        ("nat", "MOD_OVPN_NAT"),
-    ]
-    
-    for table, chain in jump_rules:
-        # Flush chain first
-        subprocess.run(["iptables", "-t", table, "-F", chain], capture_output=True)
-        # Delete chain
-        subprocess.run(["iptables", "-t", table, "-X", chain], capture_output=True)
-        logger.info(f"Removed module firewall chain: {chain}")
-    
-    # 5. Remove MADMIN -> module jump rules (the core will handle this, but clean up just in case)
-    for table, parent, chain in [
-        ("filter", "INPUT", "MOD_OVPN_INPUT"),
-        ("filter", "FORWARD", "MOD_OVPN_FORWARD"),
-        ("nat", "POSTROUTING", "MOD_OVPN_NAT"),
-    ]:
-        subprocess.run(["iptables", "-t", table, "-D", parent, "-j", chain], capture_output=True)
+    # Helper to remove references to a chain (jumps)
+    def remove_jumps_to_chain(chain_to_remove):
+        for table in ["filter", "nat"]:
+            try:
+                # Find rules jumping to this chain
+                res = subprocess.run(
+                    ["iptables", "-t", table, "-S"], 
+                    capture_output=True, text=True
+                )
+                if res.returncode != 0: continue
+                
+                for line in res.stdout.split('\n'):
+                    if f"-j {chain_to_remove}" in line:
+                        # Convert rule to delete command (replace -A with -D)
+                        parts = line.split()
+                        if "-A" in parts:
+                            idx = parts.index("-A")
+                            parts[idx] = "-D"
+                            subprocess.run(["iptables", "-t", table] + parts, capture_output=True)
+            except Exception:
+                pass
+
+    # 2. Robust Chain Cleanup: Find ALL OVPN_* chains currently in memory
+    for table in ["filter", "nat"]:
+        try:
+            result = subprocess.run(
+                ["iptables", "-t", table, "-L", "-n"],
+                capture_output=True, text=True
+            )
+            # Find all chains starting with OVPN_ or MOD_OVPN_
+            chains_to_remove = []
+            for line in result.stdout.split('\n'):
+                if line.startswith("Chain OVPN_") or line.startswith("Chain MOD_OVPN_"):
+                    chain_name = line.split()[1]
+                    chains_to_remove.append(chain_name)
+            
+            # Sort to delete instance/group chains BEFORE module chains (dependencies)
+            # Groups/Instances start with OVPN_, Module starts with MOD_OVPN_
+            # We want to delete OVPN_* first, then MOD_OVPN_*
+            # Actually, simply flushing everything first helps
+            
+            for chain in chains_to_remove:
+                # 1. Remove references to this chain from other chains
+                remove_jumps_to_chain(chain)
+                # 2. Flush chain
+                subprocess.run(["iptables", "-t", table, "-F", chain], capture_output=True)
+            
+            # 3. Delete chains (now empty and unreferenced)
+            for chain in chains_to_remove:
+                subprocess.run(["iptables", "-t", table, "-X", chain], capture_output=True)
+                logger.info(f"Removed chain: {chain} ({table})")
+                
+        except Exception as e:
+            logger.warning(f"Error cleaning up {table} table: {e}")
     
     # 6. Remove configuration and PKI directories
     dirs_to_remove = [
