@@ -257,13 +257,27 @@ async function loadInstances() {
             return;
         }
 
-        listEl.innerHTML = `<div class="table-responsive"><table class="table table-vcenter card-table">
+        listEl.innerHTML = `<div class="table-responsive"><table class="table table-vcenter card-table table-hover">
             <thead><tr>
+                <th style="width: 30px;"></th>
                 <th>Nome</th><th>Interfaccia</th><th>Porta</th><th>Subnet</th>
-                <th>Modalità</th><th>Client</th><th>Stato</th><th class="w-1"></th>
+                <th>Modalità</th><th>Client</th><th class="w-1"></th>
             </tr></thead>
-            <tbody>${instances.map(i => `<tr>
-                <td><a href="#openvpn/${i.id}" class="text-reset"><strong>${escapeHtml(i.name)}</strong></a></td>
+            <tbody>${instances.map(i => `<tr class="instance-row" data-id="${i.id}" style="cursor: pointer;">
+                <td>
+                    <span class="status-dot ${i.status === 'running' ? 'status-dot-animated bg-success' : 'bg-secondary'}" 
+                          title="${i.status === 'running' ? 'Attivo' : 'Fermo'}"></span>
+                </td>
+                <td>
+                    <a href="#openvpn/${i.id}" class="text-reset">
+                        <strong>${escapeHtml(i.name)}</strong>
+                    </a>
+                    <div class="small text-muted">
+                        ${i.status === 'running'
+                ? '<span class="text-success">Attivo</span>'
+                : '<span class="text-secondary">Fermo</span>'}
+                    </div>
+                </td>
                 <td><code>${i.interface}</code></td>
                 <td>${i.port}/${i.protocol.toUpperCase()}</td>
                 <td><code>${i.subnet}</code></td>
@@ -271,21 +285,74 @@ async function loadInstances() {
                     ${i.tunnel_mode === 'full' ? 'Full' : 'Split'}
                 </span></td>
                 <td>${i.client_count}</td>
-                <td><span class="badge ${i.status === 'running' ? 'bg-success' : 'bg-secondary'}">
-                    ${i.status === 'running' ? 'Attivo' : 'Fermo'}
-                </span></td>
-                <td><div class="btn-group">
-                    ${canManage ? (i.status === 'running'
-                ? `<button class="btn btn-sm btn-ghost-warning" onclick="stopInstance('${i.id}')" title="Ferma"><i class="ti ti-player-stop"></i></button>`
-                : `<button class="btn btn-sm btn-ghost-success" onclick="startInstance('${i.id}')" title="Avvia"><i class="ti ti-player-play"></i></button>`) : ''}
-                    <a href="#openvpn/${i.id}" class="btn btn-sm btn-ghost-primary" title="Dettagli"><i class="ti ti-eye"></i></a>
-                    ${canManage ? `<button class="btn btn-sm btn-ghost-danger" onclick="deleteInstance('${i.id}')" title="Elimina"><i class="ti ti-trash"></i></button>` : ''}
-                </div></td>
+                <td>
+                    <div class="btn-group btn-group-sm" onclick="event.stopPropagation();">
+                        ${canManage ? (i.status === 'running'
+                ? `<button class="btn btn-ghost-warning btn-stop" data-id="${i.id}" title="Ferma"><i class="ti ti-player-stop"></i></button>`
+                : `<button class="btn btn-ghost-success btn-start" data-id="${i.id}" title="Avvia"><i class="ti ti-player-play"></i></button>`) : ''}
+                        ${canManage ? `<button class="btn btn-ghost-danger btn-delete" data-id="${i.id}" title="Elimina"><i class="ti ti-trash"></i></button>` : ''}
+                    </div>
+                </td>
             </tr>`).join('')}</tbody>
         </table></div>`;
+
+        setupInstanceRowActions();
     } catch (err) {
         listEl.innerHTML = `<div class="alert alert-danger">${err.message}</div>`;
     }
+}
+
+function setupInstanceRowActions() {
+    // Row click navigates to detail
+    document.querySelectorAll('.instance-row').forEach(row => {
+        row.addEventListener('click', (e) => {
+            if (e.target.closest('.btn-group')) return;
+            window.location.hash = `#openvpn/${row.dataset.id}`;
+        });
+    });
+
+    // Start instance
+    document.querySelectorAll('.btn-start').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            const id = btn.dataset.id;
+            try {
+                await apiPost(`${MODULE_API}/instances/${id}/start`);
+                showToast('Istanza avviata', 'success');
+                loadInstances();
+            } catch (err) {
+                showToast(err.message, 'error');
+            }
+        });
+    });
+
+    // Stop instance
+    document.querySelectorAll('.btn-stop').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            const id = btn.dataset.id;
+            try {
+                await apiPost(`${MODULE_API}/instances/${id}/stop`);
+                showToast('Istanza fermata', 'success');
+                loadInstances();
+            } catch (err) {
+                showToast(err.message, 'error');
+            }
+        });
+    });
+
+    // Delete instance
+    document.querySelectorAll('.btn-delete').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            const id = btn.dataset.id;
+            if (!await confirmDialog('Eliminare questa istanza VPN?', 'Tutti i client e certificati saranno eliminati.')) return;
+            try {
+                await apiDelete(`${MODULE_API}/instances/${id}`);
+                showToast('Istanza eliminata', 'success');
+                loadInstances();
+            } catch (err) {
+                showToast(err.message, 'error');
+            }
+        });
+    });
 }
 
 async function createInstance() {
@@ -380,7 +447,7 @@ async function renderInstanceDetail(container) {
                     <div class="row">
                         <div class="col-md-2">
                             <span class="text-muted">Stato</span><br>
-                            <span class="badge ${instance.status === 'running' ? 'bg-success' : 'bg-secondary'} fs-6">
+                            <span class="badge ${instance.status === 'running' ? 'bg-success' : 'bg-secondary-lt'} fs-6">
                                 ${instance.status === 'running' ? 'Attivo' : 'Fermo'}
                             </span>
                         </div>
@@ -576,7 +643,7 @@ async function renderInstanceDetail(container) {
                         <h5 class="modal-title">Nuovo Client</h5>
                         <button class="btn-close" data-bs-dismiss="modal"></button>
                     </div>
-                    <div class="modal-body">
+        <div class="modal-body">
                         <div class="mb-3">
                             <label class="form-label" for="new-client-name">Nome del client</label>
                             <input type="text" class="form-control" id="new-client-name" placeholder="es. iPhone.Mario">
@@ -585,6 +652,13 @@ async function renderInstanceDetail(container) {
                         <div class="mb-3">
                             <label class="form-label">Durata Certificato (giorni)</label>
                             <input type="number" class="form-control" id="new-client-cert-days" placeholder="Lascia vuoto per default istanza">
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label">Gruppo Firewall (opzionale)</label>
+                            <select class="form-select" id="new-client-group">
+                                <option value="">Nessun gruppo</option>
+                            </select>
+                            <small class="form-hint">Assegna il client a un gruppo firewall durante la creazione</small>
                         </div>
                     </div>
                     <div class="modal-footer">
@@ -709,10 +783,23 @@ async function renderInstanceDetail(container) {
         </div>
         `;
 
-        // New client button - open modal
-        document.getElementById('btn-new-client')?.addEventListener('click', () => {
+        // New client button - open modal and load groups
+        document.getElementById('btn-new-client')?.addEventListener('click', async () => {
             document.getElementById('new-client-name').value = '';
             document.getElementById('new-client-cert-days').value = '';
+
+            // Load groups for dropdown
+            const groupSelect = document.getElementById('new-client-group');
+            groupSelect.innerHTML = '<option value="">Nessun gruppo</option>';
+            try {
+                const groups = await apiGet(`${MODULE_API}/instances/${currentInstanceId}/groups`);
+                groups.forEach(g => {
+                    groupSelect.innerHTML += `<option value="${g.id}">${escapeHtml(g.name)}</option>`;
+                });
+            } catch (e) {
+                // Groups not available, that's OK
+            }
+
             new bootstrap.Modal(document.getElementById('modal-new-client')).show();
         });
 
@@ -720,6 +807,7 @@ async function renderInstanceDetail(container) {
         document.getElementById('btn-confirm-new-client')?.addEventListener('click', async () => {
             const name = document.getElementById('new-client-name').value.trim();
             const certDays = document.getElementById('new-client-cert-days').value;
+            const groupId = document.getElementById('new-client-group').value || null;
             if (!name) {
                 showToast('Inserisci un nome per il client', 'error');
                 return;
@@ -727,7 +815,8 @@ async function renderInstanceDetail(container) {
             try {
                 await apiPost(`${MODULE_API}/instances/${currentInstanceId}/clients`, {
                     name,
-                    cert_duration_days: certDays ? parseInt(certDays) : null
+                    cert_duration_days: certDays ? parseInt(certDays) : null,
+                    group_id: groupId
                 });
                 showToast('Client creato con successo', 'success');
                 bootstrap.Modal.getInstance(document.getElementById('modal-new-client'))?.hide();

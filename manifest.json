@@ -1,7 +1,7 @@
 {
     "id": "openvpn",
     "name": "OpenVPN Manager",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "description": "OpenVPN server and client management with PKI, certificate generation, and multi-instance support",
     "author": "MADMIN Team",
     "system_dependencies": {

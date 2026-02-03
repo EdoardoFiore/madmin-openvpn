@@ -535,6 +535,27 @@ async def create_client(
     await db.commit()
     await db.refresh(client)
     
+    # If group_id is provided, assign client to group
+    if data.group_id:
+        # Validate group exists and belongs to this instance
+        group_result = await db.execute(
+            select(OvpnGroup).where(
+                (OvpnGroup.id == data.group_id) & 
+                (OvpnGroup.instance_id == instance_id)
+            )
+        )
+        group = group_result.scalar_one_or_none()
+        if group:
+            # Create group membership
+            member = OvpnGroupMember(group_id=data.group_id, client_id=client.id)
+            db.add(member)
+            await db.commit()
+            
+            # Apply group firewall rules if instance is running
+            if openvpn_service.get_instance_status(instance_id):
+                from .service import OpenVPNService
+                await OpenVPNService.apply_group_firewall_rules(instance_id, db)
+    
     return OvpnClientRead(
         id=client.id,
         name=client.name,

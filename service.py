@@ -993,6 +993,49 @@ class OpenVPNService:
         return OpenVPNService._run_iptables(table, ["-X", chain_name], suppress_errors=True)
     
     @staticmethod
+    def _ensure_direct_accept_rule(
+        chain: str, 
+        table: str = "filter",
+        input_interface: str = None,
+        output_interface: str = None
+    ) -> bool:
+        """
+        Ensure a direct ACCEPT rule exists in the specified chain.
+        Used for response traffic that should bypass instance chain processing.
+        """
+        # Build rule args
+        rule_args = []
+        if input_interface:
+            rule_args.extend(["-i", input_interface])
+        if output_interface:
+            rule_args.extend(["-o", output_interface])
+        rule_args.extend(["-j", "ACCEPT"])
+        
+        # Check if rule already exists
+        check_cmd = ["iptables", "-t", table, "-C", chain] + rule_args
+        result = subprocess.run(check_cmd, capture_output=True)
+        if result.returncode == 0:
+            return True  # Already exists
+        
+        # Find RETURN position to insert before it
+        result = subprocess.run(
+            ["iptables", "-t", table, "-S", chain],
+            capture_output=True,
+            text=True
+        )
+        lines = result.stdout.strip().split('\n') if result.returncode == 0 else []
+        return_pos = None
+        for i, line in enumerate(lines):
+            if '-j RETURN' in line:
+                return_pos = i
+                break
+        
+        if return_pos is not None:
+            return OpenVPNService._run_iptables(table, ["-I", chain, str(return_pos)] + rule_args)
+        else:
+            return OpenVPNService._run_iptables(table, ["-A", chain] + rule_args)
+    
+    @staticmethod
     def initialize_module_firewall_chains() -> bool:
         """Initialize module-level firewall chains."""
         OpenVPNService._create_or_flush_chain(OpenVPNService.OVPN_INPUT_CHAIN, "filter")
@@ -1052,34 +1095,22 @@ class OpenVPNService:
             "-A", input_chain, "-j", "RETURN"
         ])
         
-        # FORWARD rules
+        # FORWARD rules for response traffic - DIRECT accept in module chain
+        # This ensures traffic TO the VPN interface is accepted without going through instance chain
+        OpenVPNService._ensure_direct_accept_rule(
+            OpenVPNService.OVPN_FORWARD_CHAIN, "filter",
+            output_interface=interface
+        )
+        
+        # FORWARD: Apply default policy for all traffic from VPN
+        # Groups handle fine-grained control, default policy handles everything else
+        # (no per-route ACCEPT rules - keep it simple, groups are for special cases)
         OpenVPNService._run_iptables("filter", [
-            "-A", forward_chain, "-o", interface, "-j", "ACCEPT"
+            "-A", forward_chain, "-i", interface, "-j", firewall_default_policy
         ])
+        logger.info(f"  Traffic from VPN policy: {firewall_default_policy}")
         
-        if tunnel_mode == "split" and routes:
-            for route in routes:
-                network = route.get('network') if isinstance(route, dict) else route
-                out_iface = route.get('interface') if isinstance(route, dict) and route.get('interface') else wan_interface
-                if network:
-                    OpenVPNService._run_iptables("filter", [
-                        "-A", forward_chain, "-i", interface, "-d", network, "-j", "ACCEPT"
-                    ])
-            OpenVPNService._run_iptables("filter", [
-                "-A", forward_chain, "-i", interface, "-d", subnet, "-j", "ACCEPT"
-            ])
-            OpenVPNService._run_iptables("filter", [
-                "-A", forward_chain, "-i", interface, "-j", "DROP"
-            ])
-        else:
-             # Full tunnel: Apply default policy for traffic from VPN
-             # We use rules matching input interface to avoid capturing unrelated traffic
-             OpenVPNService._run_iptables("filter", [
-                 "-A", forward_chain, "-i", interface, "-j", firewall_default_policy
-             ])
-             logger.info(f"  Full tunnel: Traffic from VPN policy is {firewall_default_policy}")
-        
-        # NAT rules
+        # NAT rules (still use routes for MASQUERADE targeting)
         if tunnel_mode == "split" and routes:
             for route in routes:
                 network = route.get('network') if isinstance(route, dict) else route
@@ -1099,14 +1130,11 @@ class OpenVPNService:
         
         # Link to module chains
         OpenVPNService._ensure_jump_rule(OpenVPNService.OVPN_INPUT_CHAIN, input_chain, "filter")
-        # FORWARD chain: Use interface filtering to isolate instance traffic
+        # FORWARD chain: Only need jump for traffic FROM VPN (input interface)
+        # Traffic TO VPN is already handled by direct ACCEPT rule above
         OpenVPNService._ensure_interface_jump_rule(
             OpenVPNService.OVPN_FORWARD_CHAIN, forward_chain, "filter",
             input_interface=interface
-        )
-        OpenVPNService._ensure_interface_jump_rule(
-            OpenVPNService.OVPN_FORWARD_CHAIN, forward_chain, "filter",
-            output_interface=interface
         )
         OpenVPNService._ensure_jump_rule(OpenVPNService.OVPN_NAT_CHAIN, nat_chain, "nat")
         

@@ -187,6 +187,7 @@ class OvpnInstanceRead(SQLModel):
 class OvpnClientCreate(SQLModel):
     name: str
     cert_duration_days: Optional[int] = None  # Use instance default if not specified
+    group_id: Optional[str] = None  # Optional: assign client to group during creation
 
 
 class OvpnClientRead(SQLModel):

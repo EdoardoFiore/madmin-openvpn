@@ -10,6 +10,7 @@ A comprehensive OpenVPN server management module with PKI, certificate renewal, 
 - **TCP & UDP Support** - Choose protocol per instance
 - **Client Management** - Create, revoke clients with QR code and config download
 - **Firewall Groups** - Group clients and apply specific firewall rules
+- **Firewall Group Priority** - Drag-and-drop ordering to define rule precedence
 - **Static IP via CCD** - Automatic IP assignment for firewall rules
 - **Full/Split Tunnel** - Route all traffic or specific networks
 
