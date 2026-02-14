@@ -17,47 +17,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
 from .models import OvpnInstance, OvpnClient
+from core.network.utils import get_public_ip, get_default_interface
+from core.firewall import iptables as core_iptables
 
 logger = logging.getLogger(__name__)
 
 # Paths
 OPENVPN_BASE_DIR = Path("/etc/openvpn/server")
 EASYRSA_SOURCE = Path("/usr/share/easy-rsa")
-
-# Cached public IP
-_cached_public_ip = None
-
-
-def get_public_ip() -> Optional[str]:
-    """
-    Get server's public IP address.
-    Tries multiple services, caches result.
-    """
-    global _cached_public_ip
-    if _cached_public_ip:
-        return _cached_public_ip
-    
-    services = [
-        "https://api.ipify.org",
-        "https://icanhazip.com",
-        "https://checkip.amazonaws.com",
-        "https://ifconfig.me/ip"
-    ]
-    
-    for url in services:
-        try:
-            with urllib.request.urlopen(url, timeout=5) as response:
-                ip = response.read().decode('utf-8').strip()
-                if ip:
-                    _cached_public_ip = ip
-                    logger.info(f"Detected public IP: {ip}")
-                    return ip
-        except Exception as e:
-            logger.debug(f"Failed to get IP from {url}: {e}")
-            continue
-    
-    logger.warning("Could not detect public IP from any service")
-    return None
 
 
 class OpenVPNService:
@@ -818,35 +785,23 @@ class OpenVPNService:
     
     @staticmethod
     def _run_iptables(table: str, args: List[str], suppress_errors: bool = False) -> bool:
-        """Execute an iptables command."""
-        cmd = ["iptables"]
-        if table != "filter":
-            cmd.extend(["-t", table])
-        cmd.extend(args)
-        
+        """Execute an iptables command using core wrapper."""
         try:
-            subprocess.run(cmd, check=True, capture_output=True)
-            return True
-        except subprocess.CalledProcessError as e:
+            # Core returns (success, output), and raises IptablesError on failure if not suppressed
+            success, _ = core_iptables._run_iptables(table, args, suppress_errors=suppress_errors)
+            return success
+        except core_iptables.IptablesError:
+            # Error already logged by core
+            return False
+        except Exception as e:
             if not suppress_errors:
-                logger.warning(f"iptables command failed: {' '.join(cmd)}: {e.stderr.decode()}")
+                logger.error(f"Unexpected iptables error: {e}")
             return False
     
     @staticmethod
     def _get_default_interface() -> str:
         """Detect the default network interface."""
-        try:
-            result = subprocess.run(
-                ["ip", "route", "show", "default"],
-                capture_output=True,
-                text=True
-            )
-            match = re.search(r'dev\s+(\S+)', result.stdout)
-            if match:
-                return match.group(1)
-        except:
-            pass
-        return "eth0"
+        return get_default_interface() or "eth0"
     
     @staticmethod
     def _get_group_chain_name(chain_id: str, group_name: str) -> str:
